@@ -1,0 +1,6 @@
+model,trait,accuracy,precision,recall,f1
+Mistral IFT Chặng 1+2+3,mEXT,0.8945,0.8855,0.6026,0.7172
+Mistral IFT Chặng 1+2+3,mOPN,0.7543,0.9593,0.745,0.8386
+Mistral IFT Chặng 1+2+3,mAGR,0.7734,0.9112,0.6491,0.7582
+Mistral IFT Chặng 1+2+3,mCON,0.7762,0.8975,0.7106,0.7932
+Mistral IFT Chặng 1+2+3,MACRO,0.7996,0.9134,0.6768,0.7768

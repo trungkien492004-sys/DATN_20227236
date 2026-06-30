@@ -1,0 +1,312 @@
+# ============================================================
+# SFT Fine-tuning — Essays Dataset (Big Five)
+# Model: Qwen2.5-3B-Instruct + QLoRA
+# Output: Training logs + Accuracy/Precision/Recall/F1
+# Platform: Kaggle GPU T4
+# ============================================================
+
+# !pip install transformers trl peft bitsandbytes accelerate -q
+
+import os
+import gc
+import json
+import time
+import torch
+import pandas as pd
+import numpy as np
+from datasets import Dataset
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score, precision_score,
+    recall_score, f1_score, classification_report
+)
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    TrainerCallback,
+)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from trl import SFTTrainer, SFTConfig
+
+# ============================================================
+# CONFIG
+# ============================================================
+MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"   # 3B: nhanh, ổn định, T4 dễ chạy
+DATA_PATH  = "/kaggle/input/datasets/fakekin/datn-final/essays_clean.csv"
+OUTPUT_DIR = "/kaggle/working/outputs_sft_essays"
+TRAITS     = ["cEXT", "cNEU", "cAGR", "cCON", "cOPN"]
+MAX_LENGTH = 2048
+SEED       = 42
+
+SYSTEM = ("You are a psychologist classifying Big Five personality traits "
+          "from text. Respond with ONLY a JSON object.")
+
+print(f"Model: {MODEL_NAME}")
+print(f"GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory/1e9:.1f}GB")
+
+# ============================================================
+# LOAD & SPLIT DATA
+# ============================================================
+df = pd.read_csv(DATA_PATH)
+df = df[["text"] + TRAITS].dropna().reset_index(drop=True)
+print(f"\nTotal samples: {len(df)}")
+
+train_df, test_df = train_test_split(df, test_size=0.2, random_state=SEED)
+train_df, val_df  = train_test_split(train_df, test_size=0.1, random_state=SEED)
+print(f"Train: {len(train_df)} | Val: {len(val_df)} | Test: {len(test_df)}")
+
+# Lưu test set riêng
+test_df.to_csv("/kaggle/working/test_essays.csv", index=False)
+print("Saved test_essays.csv")
+
+# ============================================================
+# SFT FORMAT — prompt/completion hội thoại
+# TRL tự áp chat template + chỉ tính loss trên completion
+# ============================================================
+def build_messages(text):
+    return [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content":
+            f"Text: {str(text)}\n\n"
+            f"Classify these Big Five traits (y=high, n=low): "
+            f"{', '.join(TRAITS)}. Return only JSON."},
+    ]
+
+def format_sft(examples):
+    prompts, completions = [], []
+    for i in range(len(examples["text"])):
+        label = {t: examples[t][i] for t in TRAITS}
+        prompts.append(build_messages(examples["text"][i]))
+        completions.append([{"role": "assistant", "content": json.dumps(label)}])
+    return {"prompt": prompts, "completion": completions}
+
+_train = Dataset.from_pandas(train_df)
+_val   = Dataset.from_pandas(val_df)
+train_dataset = _train.map(format_sft, batched=True, remove_columns=_train.column_names)
+val_dataset   = _val.map(format_sft,   batched=True, remove_columns=_val.column_names)
+
+print("\nSample format:")
+print(train_dataset[0])
+
+# ============================================================
+# LOAD MODEL + QLoRA
+# ============================================================
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_use_double_quant=True,
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    quantization_config=bnb_config,
+    device_map="auto",
+)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+tokenizer.pad_token    = tokenizer.eos_token
+tokenizer.padding_side = "right"
+model.config.use_cache = False
+
+model = prepare_model_for_kbit_training(model)
+model = get_peft_model(model, LoraConfig(
+    r=16, lora_alpha=32,
+    target_modules=["q_proj","k_proj","v_proj","o_proj",
+                    "gate_proj","up_proj","down_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+))
+model.print_trainable_parameters()
+
+# ============================================================
+# CALLBACK — Ghi training log
+# ============================================================
+training_logs = []
+
+class LogCallback(TrainerCallback):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs:
+            entry = {"step": state.global_step}
+            entry.update(logs)
+            training_logs.append(entry)
+            if "loss" in logs:
+                print(f"  Step {state.global_step:4d} | loss={logs['loss']:.4f}"
+                      + (f" | eval_loss={logs.get('eval_loss',''):.4f}"
+                         if "eval_loss" in logs else ""))
+
+# ============================================================
+# TRAIN
+# ============================================================
+gc.collect()
+torch.cuda.empty_cache()
+
+trainer = SFTTrainer(
+    model=model,
+    processing_class=tokenizer,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    callbacks=[LogCallback()],
+    args=SFTConfig(
+        output_dir=OUTPUT_DIR,
+        max_length=MAX_LENGTH,
+        completion_only_loss=True,        # chỉ tính loss trên nhãn JSON
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=8,
+        num_train_epochs=3,
+        learning_rate=2e-4,
+        warmup_ratio=0.05,
+        fp16=False,
+        bf16=False,
+        optim="paged_adamw_8bit",
+        lr_scheduler_type="cosine",
+        weight_decay=0.01,
+        logging_steps=20,
+        eval_steps=100,
+        save_steps=200,
+        save_total_limit=2,
+        gradient_checkpointing=False,
+        report_to="none",
+        seed=SEED,
+    ),
+)
+
+print("\n🚀 Starting SFT training...")
+start_time = time.time()
+
+trainer_stats = trainer.train()
+
+train_time = time.time() - start_time
+print(f"\n✅ Training done in {train_time/3600:.1f} hours")
+print(trainer_stats)
+
+# Lưu training logs
+logs_df = pd.DataFrame(training_logs)
+logs_df.to_csv("/kaggle/working/training_logs.csv", index=False)
+print("Saved training_logs.csv")
+
+# Lưu model
+model.save_pretrained(f"{OUTPUT_DIR}/final_model")
+tokenizer.save_pretrained(f"{OUTPUT_DIR}/final_model")
+print("Saved final_model")
+
+# ============================================================
+# EVALUATION trên Test Set
+# ============================================================
+print("\n🔍 Evaluating on test set...")
+model.config.use_cache = True   # bật lại cache cho generate nhanh
+model.eval()
+
+def predict_traits(text):
+    prompt = tokenizer.apply_chat_template(
+        build_messages(text), tokenize=False, add_generation_prompt=True
+    )
+    inputs = tokenizer(
+        prompt, return_tensors="pt",
+        truncation=True, max_length=MAX_LENGTH - 64
+    ).to(model.device)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=64,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    generated = tokenizer.decode(
+        outputs[0][inputs["input_ids"].shape[1]:],
+        skip_special_tokens=True
+    ).strip()
+
+    try:
+        start  = generated.find("{")
+        end    = generated.rfind("}") + 1
+        parsed = json.loads(generated[start:end])
+        return {t: parsed.get(t) for t in TRAITS}
+    except Exception:
+        return {t: None for t in TRAITS}
+
+results = []
+for i, (_, row) in enumerate(test_df.iterrows()):
+    pred = predict_traits(row["text"])
+    results.append({
+        **{f"true_{t}": row[t] for t in TRAITS},
+        **{f"pred_{t}": pred[t] for t in TRAITS},
+    })
+    # In thử vài mẫu đầu để kiểm tra format output
+    if i < 5:
+        print(f"  [{i}] pred = {pred}")
+    if (i + 1) % 50 == 0:
+        print(f"  [{i+1}/{len(test_df)}] done")
+
+results_df = pd.DataFrame(results)
+results_df.to_csv("/kaggle/working/predictions_sft_essays.csv", index=False)
+
+# ============================================================
+# KẾT QUẢ CHI TIẾT
+# ============================================================
+print("\n" + "="*60)
+print("EVALUATION RESULTS — SFT Essays (Qwen2.5-3B)")
+print("="*60)
+
+summary = []
+for t in TRAITS:
+    true_vals = results_df[f"true_{t}"].map({"y": 1, "n": 0})
+    pred_vals = results_df[f"pred_{t}"].map({"y": 1, "n": 0})
+    valid     = true_vals.notna() & pred_vals.notna()
+    n_valid   = valid.sum()
+
+    if n_valid > 0:
+        tv = true_vals[valid]
+        pv = pred_vals[valid]
+        acc  = accuracy_score(tv, pv)
+        prec = precision_score(tv, pv, zero_division=0)
+        rec  = recall_score(tv, pv, zero_division=0)
+        f1   = f1_score(tv, pv, zero_division=0)
+        f1m  = f1_score(tv, pv, average="macro", zero_division=0)
+
+        print(f"\n{t}:")
+        print(f"  Accuracy:   {acc:.4f} ({acc:.2%})")
+        print(f"  Precision:  {prec:.4f}")
+        print(f"  Recall:     {rec:.4f}")
+        print(f"  F1-Score:   {f1:.4f}")
+        print(f"  F1-Macro:   {f1m:.4f}")
+        print(f"  Valid/pred: {n_valid}/{len(results_df)}")
+
+        summary.append({
+            "trait": t, "accuracy": round(acc,4),
+            "precision": round(prec,4), "recall": round(rec,4),
+            "f1": round(f1,4), "f1_macro": round(f1m,4),
+            "n_valid": int(n_valid)
+        })
+
+summary_df = pd.DataFrame(summary)
+summary_df.to_csv("/kaggle/working/summary_sft_essays.csv", index=False)
+
+print("\n" + "="*60)
+print("AVERAGE ACROSS ALL TRAITS")
+print("="*60)
+print(f"  Avg Accuracy:  {summary_df['accuracy'].mean():.4f}")
+print(f"  Avg Precision: {summary_df['precision'].mean():.4f}")
+print(f"  Avg Recall:    {summary_df['recall'].mean():.4f}")
+print(f"  Avg F1:        {summary_df['f1'].mean():.4f}")
+print(f"  Avg F1-Macro:  {summary_df['f1_macro'].mean():.4f}")
+
+print("\n" + "="*60)
+print("TRAINING SUMMARY")
+print("="*60)
+print(f"  Model:         {MODEL_NAME}")
+print(f"  GPU:           {torch.cuda.get_device_name(0)}")
+print(f"  Train time:    {train_time/3600:.2f} hours")
+print(f"  Train samples: {len(train_df)}")
+print(f"  Test samples:  {len(test_df)}")
+print(f"  Epochs:        3")
+print(f"  LoRA rank:     16, alpha: 32")
+
+print("\n✅ All results saved!")
+print("  - predictions_sft_essays.csv")
+print("  - summary_sft_essays.csv")
+print("  - training_logs.csv")

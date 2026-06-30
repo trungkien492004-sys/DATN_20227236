@@ -1,0 +1,6 @@
+trait,accuracy,precision,recall,f1,f1_macro,n_valid,n_total
+cEXT,,,,,,0,9
+cNEU,,,,,,0,9
+cAGR,,,,,,0,9
+cCON,,,,,,0,9
+cOPN,,,,,,0,9

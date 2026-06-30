@@ -1,0 +1,400 @@
+# =====================================================================
+# NOTEBOOK 1: QWEN2.5-3B — SFT CHẶNG 1 (Sequence Classification, base model)
+# Approach  : SFT thuần — classification head, KHÔNG dùng chat template
+# Fix bug   : Thêm DataCollatorWithPadding bị thiếu ở bản gốc (nguyên nhân
+#             gây lỗi khi train với dynamic padding mà không pad theo batch).
+# Thiết kế để loại bỏ rủi ro rò rỉ dữ liệu (data leakage):
+#   - Chia train/val/test CHỈ MỘT LẦN tại đây, lưu thành CSV cố định.
+#     Chặng 2 (notebook 2, gồm cả inference) sau này chỉ ĐỌC LẠI các
+#     file này, KHÔNG bao giờ chạy train_test_split lần nữa.
+#   - Lưu adapter cuối cùng (final_model), KHÔNG phụ thuộc checkpoint số.
+# =====================================================================
+
+# ============================================================
+# CELL 1 — CÀI THƯ VIỆN
+# ============================================================
+!pip install -q \
+    transformers==4.47.0 \
+    peft==0.14.0 \
+    bitsandbytes>=0.44.0 \
+    accelerate==1.2.1 \
+    datasets==3.2.0 \
+    scikit-learn \
+    --quiet
+print("✅ Cài thư viện xong!")
+
+# ============================================================
+# CELL 2 — IMPORT & CẤU HÌNH TOÀN CỤC
+# ============================================================
+import os, gc, torch, warnings
+import numpy as np
+import pandas as pd
+from datasets import Dataset
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from transformers import (
+    AutoModelForSequenceClassification, AutoTokenizer,
+    BitsAndBytesConfig, TrainingArguments,
+    Trainer, DataCollatorWithPadding,
+    TrainerCallback, set_seed
+)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+warnings.filterwarnings("ignore")
+
+# QUAN TRỌNG: dùng CÙNG MỘT MODEL_NAME này ở cả 2 notebook (1 và 2).
+MODEL_NAME = "Qwen/Qwen2.5-3B"           # SFT dùng base, KHÔNG phải Instruct
+DATA_PATH  = "/kaggle/input/datasets/fakekin/datn-final/mbti_clean.csv"
+
+SPLITS_DIR  = "/kaggle/working/splits"            # nơi lưu 4 file split cố định
+ADAPTER_DIR = "/kaggle/working/final_model_chang1"
+LOG_PATH    = "/kaggle/working/training_logs_chang1.csv"
+OUTPUT_DIR  = "/kaggle/working/outputs_chang1"     # working dir cho Trainer (checkpoint tạm)
+
+TRAITS     = ["mEXT", "mOPN", "mAGR", "mCON"]
+MAX_LENGTH = 2048
+SEED       = 42
+
+set_seed(SEED)
+os.makedirs(SPLITS_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print("=" * 60)
+print("⚙️  CẤU HÌNH NB1 — QWEN SFT CHẶNG 1")
+print("=" * 60)
+print(f"   Model      : {MODEL_NAME}")
+print(f"   Max length : {MAX_LENGTH}")
+print(f"   Output     : {OUTPUT_DIR}")
+print(f"   Device     : {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+
+# ============================================================
+# CELL 3 — ĐỌC, LÀM SẠCH & CHIA DỮ LIỆU CỐ ĐỊNH
+# ============================================================
+print("\n" + "=" * 60)
+print("📊 BƯỚC 1: ĐỌC & CHIA DỮ LIỆU")
+print("=" * 60)
+
+df = pd.read_csv(DATA_PATH)
+df = df[["TEXT_CLEAN"] + TRAITS].dropna().reset_index(drop=True)
+
+# Bộ chuyển đổi nhãn đa năng (chấp nhận cả y/n, 1/0, chuỗi hoặc số)
+for trait in TRAITS:
+    df[trait] = df[trait].astype(str).str.strip().str.lower()
+    df[trait] = df[trait].map({
+        "y": 1, "1": 1, "1.0": 1,
+        "n": 0, "0": 0, "0.0": 0
+    })
+
+df = df.dropna(subset=TRAITS).reset_index(drop=True)
+for trait in TRAITS:
+    df[trait] = df[trait].astype(int)
+
+print(f"✅ Tổng dữ liệu sau clean: {len(df)} dòng")
+print(f"   Phân phối nhãn (tỉ lệ dương tính):")
+for t in TRAITS:
+    print(f"      {t}: {df[t].mean()*100:.1f}% positive (1)")
+
+# ── Chia cố định toàn bộ pipeline (chỉ thực hiện 1 lần duy nhất, tại đây) ──
+train_val_df, test_df  = train_test_split(df, test_size=0.2, random_state=SEED)
+train_full_df, val_df  = train_test_split(train_val_df, test_size=0.1, random_state=SEED)
+train_full_df = train_full_df.sample(frac=1, random_state=SEED).reset_index(drop=True)
+
+half        = len(train_full_df) // 2
+train_1a_df = train_full_df.iloc[:half].reset_index(drop=True)   # NB1 train ngay
+train_1b_df = train_full_df.iloc[half:].reset_index(drop=True)   # NB2 train tiếp
+
+# ── Lưu file cố định để notebook 2 đọc lại — KHÔNG bao giờ split lại ────────
+train_1a_df.to_csv(f"{SPLITS_DIR}/train_1a.csv", index=False)
+train_1b_df.to_csv(f"{SPLITS_DIR}/train_1b.csv", index=False)
+val_df.to_csv(f"{SPLITS_DIR}/val.csv", index=False)
+test_df.to_csv(f"{SPLITS_DIR}/test.csv", index=False)
+
+print(f"\n   Train chặng 1 (train ngay) : {len(train_1a_df):>5} dòng")
+print(f"   Train chặng 2 (lưu lại)    : {len(train_1b_df):>5} dòng → train_1b.csv")
+print(f"   Validation                 : {len(val_df):>5} dòng → val.csv")
+print(f"   Test (giữ kín)             : {len(test_df):>5} dòng → test.csv")
+print(f"✅ Đã lưu 4 file split cố định tại: {SPLITS_DIR}")
+print("   ⚠️ Sau khi notebook này chạy xong, attach OUTPUT của notebook này làm")
+print("      Kaggle Input cho notebook chặng 2 — KHÔNG tách lại tập ở đó.")
+
+# ============================================================
+# CELL 4 — TOKENIZER & DATASET (dynamic padding qua collator)
+# ============================================================
+print("\n" + "=" * 60)
+print("📦 BƯỚC 2: TOKENIZER & DATASET")
+print("=" * 60)
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+# left padding cho classification với kiến trúc decoder-only
+tokenizer.padding_side = "left"
+
+def tokenize_df(input_df, desc=""):
+    records = []
+    for _, row in input_df.iterrows():
+        tokens = tokenizer(
+            str(row["TEXT_CLEAN"]),
+            truncation=True,
+            max_length=MAX_LENGTH,
+            padding=False                  # KHÔNG pad ở đây — pad động theo batch qua collator (Cell 7)
+        )
+        labels = [float(row[t]) for t in TRAITS]
+        records.append({
+            "input_ids":      tokens["input_ids"],
+            "attention_mask": tokens["attention_mask"],
+            "labels":         labels
+        })
+    dataset = Dataset.from_list(records)
+    print(f"   ✅ {desc}: {len(dataset)} samples")
+    return dataset
+
+train_dataset = tokenize_df(train_1a_df, "Train chặng 1")
+eval_dataset  = tokenize_df(val_df,      "Validation")
+
+# Kiểm tra độ dài thực tế
+lengths = [len(x["input_ids"]) for x in train_dataset]
+print(f"\n   📏 Token length thực — min: {min(lengths)} | "
+      f"max: {max(lengths)} | mean: {int(np.mean(lengths))}")
+pct_trunc = sum(1 for l in lengths if l == MAX_LENGTH) / len(lengths) * 100
+print(f"   ✂️  Bị cắt (== {MAX_LENGTH}): {pct_trunc:.1f}% samples")
+
+# ============================================================
+# CELL 5 — LOAD MODEL 4-BIT + INJECT LORA
+# ============================================================
+print("\n" + "=" * 60)
+print("🤖 BƯỚC 3: LOAD MODEL & INJECT LORA")
+print("=" * 60)
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.float16
+)
+
+model = AutoModelForSequenceClassification.from_pretrained(
+    MODEL_NAME,
+    num_labels=len(TRAITS),
+    problem_type="multi_label_classification",
+    quantization_config=bnb_config,
+    device_map="auto",
+    trust_remote_code=True
+)
+model.config.use_cache = False
+model.config.pad_token_id = tokenizer.pad_token_id
+model = prepare_model_for_kbit_training(model)
+
+peft_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                     "gate_proj", "up_proj", "down_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="SEQ_CLS"
+)
+model = get_peft_model(model, peft_config)
+model.print_trainable_parameters()
+
+# ============================================================
+# CELL 6 — COMPUTE METRICS
+# ============================================================
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    # 🛠️ FIX fp16 (điểm 3 review): fp16=True khiến logits có thể ở float16,
+    # np.exp trên float16 dễ tràn số → NaN. Ép float32 trước khi sigmoid.
+    logits = np.asarray(logits, dtype=np.float32)
+    probs  = 1 / (1 + np.exp(-logits))   # sigmoid
+    preds  = (probs >= 0.5).astype(int)
+    labels = labels.astype(int)
+
+    results = {}
+    f1_list = []
+    for i, trait in enumerate(TRAITS):
+        acc = accuracy_score(labels[:, i], preds[:, i])
+        pre = precision_score(labels[:, i], preds[:, i], zero_division=0)
+        rec = recall_score(labels[:, i], preds[:, i], zero_division=0)
+        f1  = f1_score(labels[:, i], preds[:, i], zero_division=0)
+        results[f"{trait}_acc"] = round(acc, 4)
+        results[f"{trait}_pre"] = round(pre, 4)
+        results[f"{trait}_rec"] = round(rec, 4)
+        results[f"{trait}_f1"]  = round(f1,  4)
+        f1_list.append(f1)
+
+    results["macro_f1"] = round(float(np.mean(f1_list)), 4)
+    return results
+
+# ============================================================
+# CELL 7 — TRAINING ARGUMENTS & TRAINER
+# 🛠️ FIX: thêm DataCollatorWithPadding — bản gốc THIẾU phần này, đây là
+# nguyên nhân nhiều khả năng gây lỗi khi train (các sample trong cùng
+# batch có độ dài input_ids khác nhau nhưng không được pad đồng nhất).
+# ============================================================
+print("\n" + "=" * 60)
+print("⚙️  BƯỚC 4: CẤU HÌNH TRAINING")
+print("=" * 60)
+
+training_logs = []
+
+class LogCallback(TrainerCallback):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs and ("loss" in logs or "eval_loss" in logs):
+            entry = {
+                "stage":      "chang1",
+                "step":       state.global_step,
+                "epoch":      round(state.epoch, 4) if state.epoch else 0,
+                "train_loss": logs.get("loss"),
+                "eval_loss":  logs.get("eval_loss"),
+                "macro_f1":   logs.get("eval_macro_f1")
+            }
+            training_logs.append(entry)
+
+            if "loss" in logs:
+                print(f"   [Step {state.global_step:4d} | Epoch {state.epoch:.2f}] Train Loss = {logs['loss']:.4f}")
+            if "eval_loss" in logs:
+                print(f"   📊 [EVAL  | Step {state.global_step:4d}] "
+                      f"Val Loss = {logs['eval_loss']:.4f} | "
+                      f"Macro F1 = {logs.get('eval_macro_f1', 0):.4f}")
+
+# Dynamic padding theo batch — pad_to_multiple_of=8 giúp tận dụng tensor core trên T4.
+data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True, pad_to_multiple_of=8)
+
+training_args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+
+    # Batch & gradient tối ưu công suất T4
+    # 🛠️ Nếu gặp "CUDA out of memory" (MAX_LENGTH=2048 + gradient_checkpointing
+    # vẫn khít trên T4 16GB): hạ per_device_train_batch_size=1 và tăng
+    # gradient_accumulation_steps=8 để giữ nguyên effective batch size = 8.
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=4,    # effective batch = 8
+    per_device_eval_batch_size=4,
+
+    # Tham số học tập chuẩn nghiên cứu
+    learning_rate=2e-4,
+    lr_scheduler_type="cosine",
+    warmup_ratio=0.05,
+    weight_decay=0.01,
+    max_grad_norm=1.0,
+
+    num_train_epochs=2,
+
+    fp16=True,
+    bf16=False,
+    optim="paged_adamw_8bit",
+
+    # Chiến lược kiểm định và lưu trữ an toàn ổ đĩa Kaggle
+    logging_steps=20,
+    eval_strategy="steps",
+    eval_steps=100,
+    save_strategy="steps",
+    save_steps=100,                 # bằng eval_steps để chống tràn ổ đĩa Kaggle
+    save_total_limit=3,
+    load_best_model_at_end=True,
+    metric_for_best_model="macro_f1",
+    greater_is_better=True,
+
+    gradient_checkpointing=True,
+    dataloader_num_workers=0,
+    report_to="none",
+    seed=SEED
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
+    data_collator=data_collator,    # 🛠️ FIX: bắt buộc phải có khi dùng dynamic padding (padding=False ở Cell 4)
+    tokenizer=tokenizer,
+    compute_metrics=compute_metrics,
+    callbacks=[LogCallback()]
+)
+
+gc.collect()
+torch.cuda.empty_cache()
+
+steps_per_epoch = len(train_dataset) // (2 * 4)
+total_steps     = steps_per_epoch * 2
+print(f"   Train  : {len(train_dataset)} samples × 2 epochs")
+print(f"   Val    : {len(eval_dataset)} samples")
+print(f"   Steps  : ~{total_steps} tổng (~{steps_per_epoch}/epoch)")
+print(f"   Lưu checkpoint mỗi 100 steps ✅")
+print(f"   Dynamic padding ON (qua DataCollatorWithPadding) ✅")
+print(f"   padding_side = left ✅")
+
+# ============================================================
+# CELL 8 — TRAIN
+# ============================================================
+print("\n" + "=" * 60)
+print("🔥 BƯỚC 5: BẮT ĐẦU TRAINING CHẶNG 1")
+print("=" * 60)
+
+trainer.train()
+
+# ============================================================
+# CELL 9 — LƯU MODEL & LOGS
+# ============================================================
+print("\n" + "=" * 60)
+print("💾 BƯỚC 6: LƯU MODEL & LOGS")
+print("=" * 60)
+
+model.save_pretrained(ADAPTER_DIR)
+tokenizer.save_pretrained(ADAPTER_DIR)
+print(f"   ✅ LoRA weights  → {ADAPTER_DIR}")
+
+logs_df = pd.DataFrame(training_logs)
+logs_df.to_csv(LOG_PATH, index=False)
+print(f"   ✅ Training logs → {LOG_PATH}")
+
+# Tóm tắt kết quả
+train_rows = logs_df.dropna(subset=["train_loss"])
+eval_rows  = logs_df.dropna(subset=["macro_f1"])
+if len(train_rows) > 0:
+    print(f"      Final train loss : {train_rows['train_loss'].iloc[-1]:.4f}")
+if len(eval_rows) > 0:
+    print(f"      Best macro F1    : {eval_rows['macro_f1'].max():.4f}")
+    print(f"      Final val loss   : {eval_rows['eval_loss'].iloc[-1]:.4f}")
+
+print("\n" + "=" * 60)
+print("🎉 NOTEBOOK 1 (CHẶNG 1) HOÀN THÀNH!")
+print(f"   → Output cần attach làm Input cho notebook 2 (chặng 2 + inference): {SPLITS_DIR}, {ADAPTER_DIR}, {LOG_PATH}")
+print("=" * 60)
+
+# ============================================================
+# CELL 10 — SANITY CHECK
+# ============================================================
+print("🔍 SANITY CHECK — Predict thử 5 mẫu val...")
+
+model.eval()
+sample_df = val_df.sample(5, random_state=SEED).reset_index(drop=True)
+correct_total = 0
+total_traits  = 0
+
+for idx, row in sample_df.iterrows():
+    tokens = tokenizer(
+        str(row["TEXT_CLEAN"])[:300],
+        return_tensors="pt",
+        truncation=True,
+        max_length=MAX_LENGTH,
+        padding=False                  # 🛠️ FIX (điểm 2 review): predict từng câu đơn lẻ, padding=True ở đây vô nghĩa
+    ).to(model.device)
+
+    with torch.no_grad():
+        logits = model(**tokens).logits
+    probs = torch.sigmoid(logits).cpu().numpy()[0]
+    preds = (probs >= 0.5).astype(int)
+
+    print(f"\n   Mẫu {idx+1}:")
+    for i, trait in enumerate(TRAITS):
+        gt   = int(row[trait])
+        pred = preds[i]
+        mark = "✅" if gt == pred else "❌"
+        correct_total += (gt == pred)
+        total_traits  += 1
+        print(f"      {mark} {trait}: GT={gt} | Pred={pred} | Prob={probs[i]:.3f}")
+
+print(f"\n   🎯 Sanity accuracy: {correct_total}/{total_traits} "
+      f"= {correct_total/total_traits*100:.1f}%")

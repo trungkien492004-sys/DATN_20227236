@@ -1,0 +1,226 @@
+# ============================================================
+# DEDICATED PIPELINE — MISTRAL 7B INSTRUCTION FINE-TUNING (IFT)
+# Platform: Kaggle GPU T4 (100% Bulletproof & Clean Setup)
+# ============================================================
+import os
+import gc
+import json
+import torch
+import time
+import pandas as pd
+import numpy as np
+from datasets import Dataset
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+# 🛠️ TỰ ĐỘNG ĐĂNG NHẬP HUGGING FACE BẰNG KAGGLE SECRETS
+from kaggle_secrets import UserSecretsClient
+try:
+    user_secrets = UserSecretsClient()
+    hf_token = user_secrets.get_secret("HF_TOKEN")
+    from huggingface_hub import login
+    login(token=hf_token)
+    print("🔑 [SUCCESS] Hugging Face logged in successfully!")
+except Exception as e:
+    print(f"⚠️ [WARNING] Could not log in via Kaggle Secrets: {e}")
+    print("Please ensure you added 'HF_TOKEN' to Add-ons -> Secrets.")
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3" 
+DATA_PATH  = "/kaggle/input/datasets/kienkien04/datn-final/essays_clean.csv"
+TRAITS     = ["cEXT", "cNEU", "cAGR", "cCON", "cOPN"]
+MAX_LENGTH = 2048
+SEED       = 42
+OUTPUT_DIR = "/kaggle/working/outputs_mistral_ift_essays"
+
+# --- Đọc và chia dữ liệu cố định ---
+print(f"\n🚀 Loading verified dataset from: {DATA_PATH}")
+df = pd.read_csv(DATA_PATH)
+
+# Chuẩn hóa tên cột chống lỗi KeyError
+df.columns = df.columns.str.strip()
+column_mapping = {col.lower(): col for col in df.columns}
+if 'text' in column_mapping:
+    df = df.rename(columns={column_mapping['text']: 'text'})
+
+print("📊 Các cột thực tế sau khi chuẩn hóa:", df.columns.tolist())
+df = df[["text"] + TRAITS].dropna().reset_index(drop=True)
+print(f"✅ Load data thành công! Tổng số mẫu đưa vào huấn luyện: {len(df)}")
+
+train_df, test_df = train_test_split(df, test_size=0.2, random_state=SEED)
+train_df, val_df  = train_test_split(train_df, test_size=0.1, random_state=SEED)
+
+# Lưu tập test cố định ra ngoài thư mục làm việc để đối chiếu sau này
+test_df.to_csv("/kaggle/working/test_essays_fixed.csv", index=False)
+
+# ============================================================
+# PREPARE MODEL & TOKENIZER (DEDICATED IFT)
+# ============================================================
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainerCallback
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from trl import SFTTrainer, SFTConfig
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+tokenizer.pad_token    = tokenizer.eos_token
+tokenizer.padding_side = "right"
+
+# 🔥 ĐỊNH DẠNG DỮ LIỆU THEO CHUẨN INSTRUCTION TEMPLATE (IFT) CỦA MISTRAL
+def format_ift_data(examples):
+    texts = []
+    for i in range(len(examples["text"])):
+        label = {t: str(examples[t][i]).strip().lower() for t in TRAITS}
+        text_content = str(examples['text'][i])
+        
+        # Áp dụng cấu trúc [INST] và [/INST] kèm token đặc biệt <s> </s> của Mistral
+        formatted_text = (
+            f"<s>[INST] Analyze the following text and predict the Big Five Personality Traits "
+            f"(cEXT, cNEU, cAGR, cCON, cOPN). Respond ONLY with a valid JSON object where keys "
+            f"are the traits and values are 'y' (high) or 'n' (low).\n\n"
+            f"Text: {text_content} [/INST] {json.dumps(label)} </s>"
+        )
+        texts.append(formatted_text)
+    return {"text": texts}
+
+train_dataset = Dataset.from_pandas(train_df).map(format_ift_data, batched=True)
+val_dataset   = Dataset.from_pandas(val_df).map(format_ift_data, batched=True)
+
+# Cấu hình lượng tử hóa 4-bit chống tràn VRAM T4
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True, 
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16,  # Giữ toán ma trận nền chạy ở FP16 cực nhẹ RAM
+    bnb_4bit_use_double_quant=True
+)
+
+# Khởi tạo mô hình nền nguyên bản theo đúng config nhà phát hành
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME, 
+    quantization_config=bnb_config, 
+    device_map="auto"
+)
+model.config.use_cache = False
+model = prepare_model_for_kbit_training(model)
+
+# Cấu hình LoRA Adapter bám sát kiến trúc nguyên bản
+peft_config = LoraConfig(
+    r=16, 
+    lora_alpha=32, 
+    target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
+    lora_dropout=0.05, 
+    bias="none", 
+    task_type="CAUSAL_LM"
+)
+model = get_peft_model(model, peft_config)
+
+# Callback ghi log loss trực quan
+training_logs = []
+class LogCallback(TrainerCallback):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs:
+            entry = {"step": state.global_step}
+            entry.update(logs)
+            training_logs.append(entry)
+            if "loss" in logs:
+                print(f"  Step {state.global_step:4d} | Train Loss: {logs['loss']:.4f}")
+
+# Cấu hình huấn luyện loại bỏ hoàn toàn xung đột GradScaler
+trainer = SFTTrainer(
+    model=model, processing_class=tokenizer, train_dataset=train_dataset, eval_dataset=val_dataset,
+    callbacks=[LogCallback()],
+    args=SFTConfig(
+        output_dir=OUTPUT_DIR, dataset_text_field="text", max_length=MAX_LENGTH,
+        per_device_train_batch_size=1, gradient_accumulation_steps=8, num_train_epochs=3,
+        learning_rate=3e-5,         
+        warmup_ratio=0.05, 
+        fp16=False,                 # 🔥 Tắt đi để triệt tiêu hoàn toàn lỗi GradScaler BFloat16 trên T4
+        bf16=False,                 # T4 không hỗ trợ phần cứng tăng tốc bf16 nên để False
+        max_grad_norm=0.3,          
+        optim="paged_adamw_8bit", lr_scheduler_type="cosine", logging_steps=20, report_to="none", seed=SEED,
+        gradient_checkpointing=True
+    ),
+)
+
+# ============================================================
+# EXECUTE TRAINING
+# ============================================================
+print("\n🚀 Training Mistral IFT Model...")
+trainer.train()
+
+# Lưu nhật ký loss & Trọng số checkpoint cuối cùng của IFT
+pd.DataFrame(training_logs).to_csv("/kaggle/working/training_logs_mistral_ift_essays.csv", index=False)
+model.save_pretrained(f"{OUTPUT_DIR}/final_model")
+tokenizer.save_pretrained(f"{OUTPUT_DIR}/final_model")
+print("✅ IFT Training and saving completed successfully!")
+
+# ============================================================
+# INDEPENDENT TEST EVALUATION
+# ============================================================
+print("\n🔍 Running Inference on Test set...")
+model.eval()
+results = []
+
+for i, (_, row) in enumerate(test_df.iterrows()):
+    # Đồng bộ Prompt Test theo cấu trúc IFT giống như khi Train
+    prompt = (
+        f"<s>[INST] Analyze the following text and predict the Big Five Personality Traits "
+        f"(cEXT, cNEU, cAGR, cCON, cOPN). Respond ONLY with a valid JSON object where keys "
+        f"are the traits and values are 'y' (high) or 'n' (low).\n\n"
+        f"Text: {str(row['text'])} [/INST]"
+    )
+    
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=MAX_LENGTH).to(model.device)
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=60, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+
+    generated = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+
+    # Xử lý chuỗi JSON thông minh và ép chữ thường để tránh lệch pha chữ hoa/thường
+    try:
+        start, end = generated.find("{"), generated.rfind("}") + 1
+        parsed = json.loads(generated[start:end])
+        pred_dict = {t: str(parsed.get(t)).strip().lower() for t in TRAITS}
+    except:
+        pred_dict = {t: None for t in TRAITS}
+
+    results.append({**{f"true_{t}": str(row[t]).strip().lower() for t in TRAITS}, **{f"pred_{t}": pred_dict[t] for t in TRAITS}})
+
+# Lưu bảng kết quả dự đoán chi tiết IFT
+results_df = pd.DataFrame(results)
+results_df.to_csv("/kaggle/working/predictions_mistral_ift_essays.csv", index=False)
+
+# --- TÍNH TOÁN METRICS CHI TIẾT ---
+summary = []
+for t in TRAITS:
+    true_vals = results_df[f"true_{t}"].map({"y": 1, "n": 0})
+    pred_vals = results_df[f"pred_{t}"].map({"y": 1, "n": 0})
+    valid     = true_vals.notna() & pred_vals.notna()
+    
+    if valid.sum() > 0:
+        tv, pv = true_vals[valid], pred_vals[valid]
+        summary.append({
+            "trait": t, 
+            "accuracy": round(accuracy_score(tv, pv), 4),
+            "precision": round(precision_score(tv, pv, zero_division=0), 4),
+            "recall": round(recall_score(tv, pv, zero_division=0), 4),
+            "f1": round(f1_score(tv, pv, zero_division=0), 4),
+            "f1_macro": round(f1_score(tv, pv, average="macro", zero_division=0), 4)
+        })
+
+summary_df = pd.DataFrame(summary)
+summary_df.to_csv("/kaggle/working/summary_mistral_ift_essays.csv", index=False)
+
+# 🔥 CHẶN ĐỨNG LỖI KEYERROR: Kiểm tra xem DataFrame có dữ liệu hợp lệ hay không trước khi tính Mean
+if not summary_df.empty and 'accuracy' in summary_df.columns:
+    print("\n📊 AVERAGE METRICS FOR MISTRAL IFT:")
+    print(f"  Avg Accuracy:  {summary_df['accuracy'].mean():.4f} | Avg F1-Macro:  {summary_df['f1_macro'].mean():.4f}")
+else:
+    print("\n⚠️ [WARNING] Không thể tính toán chỉ số trung bình vì cấu trúc JSON đầu ra của mô hình không hợp lệ trên toàn bộ tập test.")
+    print("Vui lòng kiểm tra chi tiết tại file: /kaggle/working/predictions_mistral_ift_essays.csv")
+
+# --- GIẢI PHÓNG TOÀN BỘ VRAM BẢO VỆ ENVIRONMENT ---
+del model, tokenizer, trainer, train_dataset, val_dataset
+gc.collect()
+torch.cuda.empty_cache()
+print("\n🎉 ALL MISTRAL IFT PROCESS COMPLETED AND VRAM CLEARED!")

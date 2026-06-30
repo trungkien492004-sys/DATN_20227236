@@ -1,0 +1,349 @@
+# =====================================================================
+# NOTEBOOK 2A (SUCCINCT FIX): QWEN2.5-3B — IFT CHẶNG 1
+# Platform  : Kaggle GPU T4 x2 (Ép chạy đơn card tối ưu hóa tài nguyên)
+# Approach  : IFT — chat template (system/user/assistant), CausalLM
+# Fix lỗi   : Khóa n_gpu=1 + Custom Data Collator chống lệch độ dài labels (-100)
+# Input     : mbti_clean.csv + các file cố định từ NB1A
+# =====================================================================
+
+# ── BƯỚC 1: CÀI ĐẶT THƯ VIỆN ĐỘC LẬP ──────────────────────────────────
+!pip install -q \
+    transformers==4.47.0 \
+    peft==0.14.0 \
+    bitsandbytes>=0.44.0 \
+    accelerate==1.2.1 \
+    datasets==3.2.0 \
+    scikit-learn \
+    --quiet
+
+print("✅ Cài thư viện xong!")
+
+# ── BƯỚC 2: IMPORT THƯ VIỆN & CẤU HÌNH BIẾN MÔI TRƯỜNG KHÓA GPU ───────
+import os, gc, json, re, torch, warnings
+import numpy as np
+import pandas as pd
+from datasets import Dataset
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
+
+# Giải pháp cốt lõi 1: Cô lập môi trường, ép Trainer chỉ thấy 1 GPU để kiểm soát tuyệt đối Batch Size = 1
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+from transformers import (
+    AutoModelForCausalLM, AutoTokenizer,
+    BitsAndBytesConfig, TrainingArguments,
+    Trainer, TrainerCallback, set_seed
+)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+warnings.filterwarnings("ignore")
+
+# Cấu hình tham số chạy
+MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
+DATA_PATH  = "/kaggle/input/datasets/lethuthao26/datn-finall/mbti_clean.csv"
+OUTPUT_DIR = "/kaggle/working/outputs_qwen_ift_2a"
+
+TRAITS     = ["mEXT", "mOPN", "mAGR", "mCON"]
+MAX_LENGTH = 2048
+SEED       = 42
+
+set_seed(SEED)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print("=" * 60)
+print("⚙️  CẤU HÌNH NB2A — QWEN IFT CHẶNG 1 (ĐÃ SỬA LỖI TENSOR LABELS)")
+print("=" * 60)
+print(f"    Model      : {MODEL_NAME}")
+print(f"    Max length : {MAX_LENGTH}")
+print(f"    Output     : {OUTPUT_DIR}")
+print(f"    Device     : {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'} (Khóa GPU 0)")
+
+# ── BƯỚC 3: ĐỌC & PHÂN CHIA DỮ LIỆU ĐỊNH DẠNG GỐC ──────────────────────
+print("\n" + "=" * 60)
+print("📊 BƯỚC 3: ĐỌC & CHIA DỮ LIỆU")
+print("=" * 60)
+
+df = pd.read_csv(DATA_PATH)
+df = df[["TEXT_CLEAN"] + TRAITS].dropna().reset_index(drop=True)
+
+for trait in TRAITS:
+    df[trait] = df[trait].astype(str).str.strip().str.lower()
+    df[trait] = df[trait].map({
+        "y": 1, "1": 1, "1.0": 1,
+        "n": 0, "0": 0, "0.0": 0
+    })
+df = df.dropna(subset=TRAITS).reset_index(drop=True)
+for trait in TRAITS:
+    df[trait] = df[trait].astype(int)
+
+print(f"✅ Tổng data gốc: {len(df)} dòng")
+
+# Chia dữ liệu cố định (giữ nguyên quy luật split để đối chiếu chéo công bằng)
+train_val_df, test_df  = train_test_split(df, test_size=0.2, random_state=SEED)
+train_full_df, val_df  = train_test_split(train_val_df, test_size=0.1, random_state=SEED)
+train_full_df = train_full_df.sample(frac=1, random_state=SEED).reset_index(drop=True)
+
+# Chia đôi tập huấn luyện cho 2 chặng học liên tiếp
+half        = len(train_full_df) // 2
+train_1a_df = train_full_df.iloc[:half].reset_index(drop=True)
+train_1b_df = train_full_df.iloc[half:].reset_index(drop=True)
+
+# Ghi nhận các file trung gian ra bộ nhớ tạm của Kaggle
+test_df.to_csv("/kaggle/working/test_mbti_fixed.csv",   index=False)
+val_df.to_csv("/kaggle/working/val_mbti_fixed.csv",     index=False)
+train_1b_df.to_csv("/kaggle/working/train_1b_mbti.csv", index=False)
+
+print(f"    Train 2A : {len(train_1a_df):>5} dòng ← train ngay tại đây")
+print(f"    Train 2B : {len(train_1b_df):>5} dòng → lưu làm tài nguyên NB2B")
+print(f"    Val      : {len(val_df):>5} dòng → val_mbti_fixed.csv")
+print(f"    Test     : {len(test_df):>5} dòng → test_mbti_fixed.csv")
+
+# ── BƯỚC 4: TOKENIZER & ÁP DỤNG CHAT TEMPLATE + CHE NHÃN PROMPT ───────
+print("\n" + "=" * 60)
+print("📦 BƯỚC 4: TOKENIZER & FORMAT IFT")
+print("=" * 60)
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right"
+
+SYSTEM_PROMPT = (
+    "You are an expert psychological assessment assistant. "
+    "Analyze the given text and predict the MBTI personality traits. "
+    "Output ONLY a valid JSON object with keys mEXT, mOPN, mAGR, mCON "
+    "and values 'y' (high) or 'n' (low). No explanation needed."
+)
+
+def label_to_yn(row):
+    return {t: ("y" if int(row[t]) == 1 else "n") for t in TRAITS}
+
+def preprocess_df_to_dataset(input_df, desc=""):
+    tokenized_data = []
+    for _, row in input_df.iterrows():
+        label_dict = label_to_yn(row)
+        
+        messages_full = [
+            {"role": "system",    "content": SYSTEM_PROMPT},
+            {"role": "user",      "content": f"Text:\n{str(row['TEXT_CLEAN'])}"},
+            {"role": "assistant", "content": json.dumps(label_dict)}
+        ]
+        
+        messages_prompt = [
+            {"role": "system",    "content": SYSTEM_PROMPT},
+            {"role": "user",      "content": f"Text:\n{str(row['TEXT_CLEAN'])}"}
+        ]
+        
+        full_text = tokenizer.apply_chat_template(messages_full, tokenize=False, add_generation_prompt=False)
+        prompt_text = tokenizer.apply_chat_template(messages_prompt, tokenize=False, add_generation_prompt=True)
+        
+        tokens_full = tokenizer(full_text, truncation=True, max_length=MAX_LENGTH)
+        tokens_prompt = tokenizer(prompt_text, truncation=True, max_length=MAX_LENGTH)
+        
+        input_ids = tokens_full["input_ids"]
+        attention_mask = tokens_full["attention_mask"]
+        
+        labels = list(input_ids)
+        prompt_len = min(len(tokens_prompt["input_ids"]), len(input_ids))
+        
+        # Che nhãn toàn bộ token thuộc vùng prompt bằng -100
+        for i in range(prompt_len):
+            labels[i] = -100
+            
+        tokenized_data.append({
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels
+        })
+        
+    dataset = Dataset.from_list(tokenized_data)
+    print(f"    ✅ {desc}: {len(dataset)} mẫu cấu trúc thành công")
+    return dataset
+
+train_dataset = preprocess_df_to_dataset(train_1a_df, "Train 2A")
+eval_dataset  = preprocess_df_to_dataset(val_df,      "Validation")
+
+# ── BƯỚC 5: TẢI MÔ HÌNH QUAN TIZA 4-BIT & EMBED LORA ADAPTER ──────────
+print("\n" + "=" * 60)
+print("🤖 BƯỚC 5: LOAD MODEL & INJECT LORA")
+print("=" * 60)
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.float16
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    quantization_config=bnb_config,
+    device_map={"": 0},  # Ép chặt chạy trên luồng GPU 0 duy nhất
+    trust_remote_code=True
+)
+model.config.use_cache = False
+model = prepare_model_for_kbit_training(model)
+
+peft_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM"
+)
+model = get_peft_model(model, peft_config)
+model.print_trainable_parameters()
+
+# ── BƯỚC 6: XÂY DỰNG HÀM LOGITS PREPROCESS & COMPUTE METRICS ──────────
+def preprocess_logits_for_metrics(logits, labels):
+    if isinstance(logits, tuple):
+        logits = logits[0]
+    return logits.argmax(dim=-1)
+
+def compute_metrics_ift(eval_pred):
+    preds, labels = eval_pred
+    shift_preds = preds[..., :-1].reshape(-1)
+    shift_labels = labels[..., 1:].reshape(-1)
+
+    mask = shift_labels != -100
+    shift_preds = shift_preds[mask]
+    shift_labels = shift_labels[mask]
+
+    if len(shift_labels) == 0:
+        return {"token_accuracy": 0.0}
+
+    acc = accuracy_score(shift_labels, shift_preds)
+    return {"token_accuracy": round(float(acc), 4)}
+
+# ── BƯỚC 7: THIẾT LẬP THAM SỐ HUẤN LUYỆN & KHỞI TẠO TRAINER ────────────
+print("\n" + "=" * 60)
+print("⚙️  BƯỚC 7: CẤU HÌNH TRAINING VỚI CUSTOM DATA COLLATOR")
+print("=" * 60)
+
+# Giải pháp cốt lõi 2: Custom Data Collator xử lý padding thủ công cho nhãn đặc thù -100 độc lập với Tokenizer
+class CustomDataCollatorForIFT:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def __call__(self, features):
+        max_len = max(len(f["input_ids"]) for f in features)
+        
+        input_ids, attention_mask, labels = [], [], []
+        for f in features:
+            remainder = max_len - len(f["input_ids"])
+            # Do cấu hình padding_side = "right"
+            input_ids.append(f["input_ids"] + [self.tokenizer.pad_token_id] * remainder)
+            attention_mask.append(f["attention_mask"] + [0] * remainder)
+            labels.append(f["labels"] + [-100] * remainder)
+            
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long)
+        }
+
+data_collator = CustomDataCollatorForIFT(tokenizer=tokenizer)
+training_logs = []
+
+class LogCallback(TrainerCallback):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs and ("loss" in logs or "eval_loss" in logs):
+            entry = {
+                "step":         state.global_step,
+                "epoch":        round(state.epoch, 4) if state.epoch else 0,
+                "train_loss":   logs.get("loss"),
+                "eval_loss":    logs.get("eval_loss"),
+                "token_acc":    logs.get("eval_token_accuracy")
+            }
+            training_logs.append(entry)
+            if "loss" in logs:
+                print(f"   [Step {state.global_step:4d} | Epoch {state.epoch:.2f}] Train Loss = {logs['loss']:.4f}")
+            if "eval_loss" in logs:
+                print(f"    📊 [EVAL  | Step {state.global_step:4d}] Val Loss = {logs['eval_loss']:.4f} | Token Acc = {logs.get('eval_token_accuracy', 0):.4f}")
+
+training_args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=8,
+    per_device_eval_batch_size=1,
+    learning_rate=2e-4,
+    lr_scheduler_type="cosine",
+    warmup_ratio=0.05,
+    weight_decay=0.01,
+    max_grad_norm=1.0,
+    num_train_epochs=2,
+    fp16=True,
+    bf16=False,
+    optim="paged_adamw_8bit",
+    logging_steps=20,
+    eval_strategy="steps",
+    eval_steps=100,
+    save_strategy="steps",
+    save_steps=100,
+    save_total_limit=3,
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_loss",
+    greater_is_better=False,
+    gradient_checkpointing=True,
+    report_to="none",
+    seed=SEED
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
+    data_collator=data_collator,
+    compute_metrics=compute_metrics_ift,
+    preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+    callbacks=[LogCallback()]
+)
+
+gc.collect()
+torch.cuda.empty_cache()
+
+print(f"    Train  : {len(train_dataset)} samples × 2 epochs")
+print(f"    Steps  : ~{len(train_dataset) // 8 * 2} tổng bước")
+print(f"    Metric : Chọn eval_loss làm tiêu chí tối ưu hóa")
+
+# ── BƯỚC 8: KÍCH HOẠT QUÁ TRÌNH HUẤN LUYỆN IFT CHẶNG 1 ──────────────────
+print("\n" + "=" * 60)
+print("🔥 BƯỚC 8: BẮT ĐẦU TRAINING IFT CHẶNG 1")
+print("=" * 60)
+
+trainer.train()
+
+# ── BƯỚC 9: ĐÓNG GÓI MÔ HÌNH VÀ XUẤT FILE LOGS CHẠY THỰC TẾ ────────────
+print("\n" + "=" * 60)
+print("💾 BƯỚC 9: LƯU MODEL & LOGS")
+print("=" * 60)
+
+final_path = f"{OUTPUT_DIR}/final_model"
+model.save_pretrained(final_path)
+tokenizer.save_pretrained(final_path)
+print(f"    ✅ Đã lưu cấu trúc LoRA Adapter thành công tại: {final_path}")
+
+logs_df = pd.DataFrame(training_logs)
+logs_df.to_csv("/kaggle/working/training_logs_qwen_ift_2a.csv", index=False)
+print(f"    ✅ Ghi nhận file logs thành công!")
+
+# ── BƯỚC 10: KIỂM TRA CHẤT LƯỢNG ĐẦU RA THỰC TẾ (SANITY CHECK) ──────────
+print("\n🔍 SANITY CHECK — Thử nghiệm giải mã sinh ký tự...")
+model.eval()
+sample_df = val_df.sample(3, random_state=SEED).reset_index(drop=True)
+
+for idx, row in sample_df.iterrows():
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": f"Text:\n{str(row['TEXT_CLEAN'])[:300]}"}
+    ]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=MAX_LENGTH - 50).to(model.device)
+
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=50, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+
+    generated = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+    print(f"    Mẫu {idx+1} thô sinh ra: {generated}")

@@ -1,0 +1,561 @@
+# =====================================================================
+# NOTEBOOK 3: MISTRAL-7B-INSTRUCT — IFT CHẶNG 3 + INFERENCE TRÊN TEST
+#   - PHẦN A (train chặng 3): train tiếp trên train_1c từ adapter chặng 2.
+#     FIX LEAK VAL: cắt ~15% từ train_1c làm val_1c (eval sạch). Resume checkpoint.
+#   - PHẦN B (inference): LẦN DUY NHẤT test set được đưa vào model. Sinh chuỗi
+#     JSON bằng model.generate, parse multi-tier (json.loads → regex → fallback),
+#     so với ground-truth → metrics + confusion matrix + loss curve 3 chặng.
+# =====================================================================
+
+# ── BƯỚC 0: ÉP ĐƠN GPU TRƯỚC KHI IMPORT TORCH ──────────────────────
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+# ── BƯỚC 1: CÀI ĐẶT THƯ VIỆN (PIN Y HỆT 2 NB TRƯỚC) ──────────────────
+!pip install -q \
+    transformers==4.47.0 \
+    peft==0.14.0 \
+    bitsandbytes>=0.44.0 \
+    accelerate==1.2.1 \
+    datasets==3.2.0 \
+    scikit-learn \
+    matplotlib \
+    seaborn \
+    --quiet
+print("✅ Cài thư viện xong!")
+
+# ── BƯỚC 2: IMPORT & CẤU HÌNH ─────────────────────────────────────────
+import gc, json, re, torch, warnings, glob
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datasets import Dataset
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+)
+from sklearn.model_selection import train_test_split
+from transformers import (
+    AutoModelForCausalLM, AutoTokenizer,
+    BitsAndBytesConfig, TrainingArguments,
+    Trainer, DataCollatorForLanguageModeling,
+    TrainerCallback, set_seed
+)
+from peft import PeftModel, prepare_model_for_kbit_training
+
+warnings.filterwarnings("ignore")
+
+MODEL_NAME  = "mistralai/Mistral-7B-Instruct-v0.2"
+MODEL_LABEL = "Mistral IFT Chặng 1+2+3"
+
+# ── TỰ ĐỘNG DÒ ĐƯỜNG DẪN (không cần biết slug, không lo sai 1 ký tự) ──
+# Chặng 3 cần CẢ output chặng 1 (splits + log1) LẪN output chặng 2
+# (adapter chặng 2 + log2). Sau khi attach cả 2 notebook làm Input, hàm
+# dưới quét /kaggle/input tìm đúng tên thư mục/file, tránh lỗi sai slug.
+def _find_dir(target_name, search_root="/kaggle/input"):
+    for root, dirs, _ in os.walk(search_root):
+        if os.path.basename(root) == target_name:
+            return root
+        for d in dirs:
+            if d == target_name:
+                return os.path.join(root, d)
+    return None
+
+def _find_file(target_name, search_root="/kaggle/input"):
+    for root, _, files in os.walk(search_root):
+        if target_name in files:
+            return os.path.join(root, target_name)
+    return None
+
+SPLITS_DIR         = _find_dir("splits")
+CHANG1_LOG_PATH    = _find_file("training_logs_chang1.csv")
+CHANG2_ADAPTER_DIR = _find_dir("final_model_chang2")
+CHANG2_LOG_PATH    = _find_file("training_logs_chang2.csv")
+
+if not all([SPLITS_DIR, CHANG1_LOG_PATH, CHANG2_ADAPTER_DIR, CHANG2_LOG_PATH]):
+    print("⚠️ KHÔNG tự dò được đủ path. Cây thư mục /kaggle/input hiện có:")
+    for r, d, fs in os.walk("/kaggle/input"):
+        print("  [DIR]", r)
+        for f in fs:
+            print("       ", f)
+    print("\nDò được:")
+    print(f"   SPLITS_DIR         = {SPLITS_DIR}")
+    print(f"   CHANG1_LOG_PATH    = {CHANG1_LOG_PATH}")
+    print(f"   CHANG2_ADAPTER_DIR = {CHANG2_ADAPTER_DIR}")
+    print(f"   CHANG2_LOG_PATH    = {CHANG2_LOG_PATH}")
+    raise FileNotFoundError(
+        "Thiếu output chặng 1 hoặc chặng 2. Kiểm tra đã attach CẢ HAI notebook "
+        "(chặng 1 VÀ chặng 2) làm Input chưa. Xem cây ở trên rồi gán cứng nếu cần."
+    )
+
+print("✅ Tự dò path thành công:")
+print(f"   SPLITS_DIR         = {SPLITS_DIR}")
+print(f"   CHANG1_LOG_PATH    = {CHANG1_LOG_PATH}")
+print(f"   CHANG2_ADAPTER_DIR = {CHANG2_ADAPTER_DIR}")
+print(f"   CHANG2_LOG_PATH    = {CHANG2_LOG_PATH}")
+
+ADAPTER_DIR = "/kaggle/working/final_model_chang3"
+LOG_PATH    = "/kaggle/working/training_logs_chang3.csv"
+OUTPUT_DIR  = "/kaggle/working/outputs_chang3"
+INFER_DIR   = "/kaggle/working/outputs_inference"
+
+TRAITS      = ["mEXT", "mOPN", "mAGR", "mCON"]
+MAX_LENGTH  = 2048
+SEED        = 42
+
+set_seed(SEED)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(INFER_DIR, exist_ok=True)
+
+def get_latest_checkpoint(output_dir):
+    checkpoints = glob.glob(os.path.join(output_dir, "checkpoint-*"))
+    if not checkpoints:
+        return None
+    checkpoints.sort(key=lambda x: int(x.split("-")[-1]))
+    return checkpoints[-1]
+
+assert os.path.exists(SPLITS_DIR), f"Không tìm thấy SPLITS_DIR: {SPLITS_DIR}"
+assert os.path.exists(CHANG2_ADAPTER_DIR), f"Không tìm thấy adapter chặng 2: {CHANG2_ADAPTER_DIR}"
+
+print(f"GPU khả dụng: {torch.cuda.device_count()} card")
+assert torch.cuda.device_count() == 1, "Vẫn thấy nhiều hơn 1 GPU! Kiểm tra CUDA_VISIBLE_DEVICES."
+
+SYSTEM_PROMPT = (
+    "You are an expert psychological assessment assistant. "
+    "Analyze the given text and predict the MBTI personality traits. "
+    "Output ONLY a valid JSON object with keys mEXT, mOPN, mAGR, mCON "
+    "and values 'y' (high) or 'n' (low). No explanation needed."
+)
+
+def label_to_yn(row):
+    return {t: ("y" if int(row[t]) == 1 else "n") for t in TRAITS}
+
+# =====================================================================
+# PHẦN A: TRAIN CHẶNG 3 (trên train_1c, tiếp nối adapter chặng 2)
+# =====================================================================
+
+# ── BƯỚC A1: ĐỌC LẠI SPLIT CỐ ĐỊNH + CẮT val_1c (vá leak) ─────────────
+train_1c_full = pd.read_csv(f"{SPLITS_DIR}/train_1c.csv")
+
+# 🛠️ FIX LEAK VALIDATION: val.csv đã được NB1/NB2 dùng chọn checkpoint ở chặng
+# 1 và 2 → cắt ~15% từ train_1c làm val_1c (eval sạch cho chặng 3).
+train_1c_df, val_1c_df = train_test_split(train_1c_full, test_size=0.15, random_state=SEED)
+train_1c_df = train_1c_df.reset_index(drop=True)
+val_1c_df   = val_1c_df.reset_index(drop=True)
+
+print(f"✅ Đọc lại split cố định từ chặng 1: train_1c gốc = {len(train_1c_full)} dòng")
+print(f"   → Cắt làm eval sạch cho chặng 3: Train 1C = {len(train_1c_df)} | Val_1c = {len(val_1c_df)}")
+print(f"   ⚠️ KHÔNG dùng val.csv chung (đã leak ở chặng 1+2) để chọn checkpoint chặng 3.")
+
+if len(val_1c_df) < 30:
+    print(f"   ⚠️ CẢNH BÁO: val_1c chỉ {len(val_1c_df)} mẫu — quá nhỏ, eval_loss sẽ nhiễu. Cân nhắc giảm test_size.")
+
+# ── BƯỚC A2: TOKENIZER & CHAT TEMPLATE (load từ adapter chặng 2) ───────
+tokenizer = AutoTokenizer.from_pretrained(CHANG2_ADAPTER_DIR, trust_remote_code=True)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right"
+
+def preprocess_df_to_dataset(input_df, desc=""):
+    tokenized_data = []
+    for _, row in input_df.iterrows():
+        label_dict = label_to_yn(row)
+        messages_full = [
+            {"role": "user",      "content": f"{SYSTEM_PROMPT}\n\nText:\n{str(row['TEXT_CLEAN'])}"},
+            {"role": "assistant", "content": json.dumps(label_dict)}
+        ]
+        messages_prompt = [
+            {"role": "user", "content": f"{SYSTEM_PROMPT}\n\nText:\n{str(row['TEXT_CLEAN'])}"}
+        ]
+        full_text   = tokenizer.apply_chat_template(messages_full,   tokenize=False, add_generation_prompt=False)
+        prompt_text = tokenizer.apply_chat_template(messages_prompt, tokenize=False, add_generation_prompt=True)
+        tokens_full   = tokenizer(full_text,   truncation=True, max_length=MAX_LENGTH)
+        tokens_prompt = tokenizer(prompt_text, truncation=True, max_length=MAX_LENGTH)
+        input_ids      = tokens_full["input_ids"]
+        attention_mask = tokens_full["attention_mask"]
+        labels = list(input_ids)
+        prompt_len = min(len(tokens_prompt["input_ids"]), len(input_ids))
+        for i in range(prompt_len):
+            labels[i] = -100
+        tokenized_data.append({"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels})
+    dataset = Dataset.from_list(tokenized_data)
+    print(f"    ✅ {desc}: {len(dataset)} mẫu đóng gói thành công")
+    return dataset
+
+train_dataset = preprocess_df_to_dataset(train_1c_df, "Train 1C IFT")
+eval_dataset  = preprocess_df_to_dataset(val_1c_df,   "Val_1c (eval sạch chặng 3)")
+
+# ── BƯỚC A3: LOAD BASE MODEL 4-BIT + GẮN ADAPTER CHẶNG 2 ──────────────
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.float16
+)
+
+base_model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    quantization_config=bnb_config,
+    device_map={"": 0},
+    trust_remote_code=True
+)
+base_model.config.use_cache = False
+base_model.config.pad_token_id = tokenizer.pad_token_id
+base_model = prepare_model_for_kbit_training(base_model, use_gradient_checkpointing=True)
+
+print(f"🚀 Nạp adapter chặng 2 từ: {CHANG2_ADAPTER_DIR}")
+model = PeftModel.from_pretrained(base_model, CHANG2_ADAPTER_DIR, is_trainable=True)
+model.print_trainable_parameters()
+
+# ── BƯỚC A4: METRICS ──────────────────────────────────────────────────
+def preprocess_logits_for_metrics(logits, labels):
+    if isinstance(logits, tuple):
+        logits = logits[0]
+    return logits.argmax(dim=-1)
+
+def compute_metrics_ift(eval_pred):
+    preds, labels = eval_pred
+    shift_preds  = preds[..., :-1].reshape(-1)
+    shift_labels = labels[..., 1:].reshape(-1)
+    mask = shift_labels != -100
+    shift_preds  = shift_preds[mask]
+    shift_labels = shift_labels[mask]
+    if len(shift_labels) == 0:
+        return {"token_accuracy": 0.0}
+    return {"token_accuracy": round(float(accuracy_score(shift_labels, shift_preds)), 4)}
+
+# ── BƯỚC A5: TRAINING ARGS & TRAINER ──────────────────────────────────
+training_logs = []
+
+class LogCallback(TrainerCallback):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs and ("loss" in logs or "eval_loss" in logs):
+            entry = {
+                "stage":      "chang3",
+                "step":       state.global_step,
+                "epoch":      round(state.epoch, 4) if state.epoch else 0,
+                "train_loss": logs.get("loss"),
+                "eval_loss":  logs.get("eval_loss"),
+                "token_acc":  logs.get("eval_token_accuracy")
+            }
+            training_logs.append(entry)
+            if "loss" in logs:
+                print(f"   [Step {state.global_step:4d} | Epoch {state.epoch:.2f}] Train Loss = {logs['loss']:.4f}")
+            if "eval_loss" in logs:
+                print(f"    📊 [EVAL | Step {state.global_step:4d}] Val Loss = {logs['eval_loss']:.4f} | "
+                      f"Token Acc = {logs.get('eval_token_accuracy', 0):.4f}")
+
+data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+training_args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=8,
+    per_device_eval_batch_size=1,
+    learning_rate=2e-4,
+    lr_scheduler_type="cosine",
+    warmup_ratio=0.05,
+    weight_decay=0.01,
+    max_grad_norm=1.0,
+    num_train_epochs=2,
+    fp16=True,
+    bf16=False,
+    optim="paged_adamw_8bit",
+    logging_steps=20,
+    eval_strategy="steps",
+    eval_steps=100,
+    save_strategy="steps",
+    save_steps=100,
+    save_total_limit=3,
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_loss",
+    greater_is_better=False,
+    gradient_checkpointing=True,
+    gradient_checkpointing_kwargs={"use_reentrant": False},
+    dataloader_num_workers=0,
+    report_to="none",
+    seed=SEED
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
+    data_collator=data_collator,
+    compute_metrics=compute_metrics_ift,
+    preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+    callbacks=[LogCallback()]
+)
+
+gc.collect()
+torch.cuda.empty_cache()
+
+# ── BƯỚC A6: TRAIN — CÓ RESUME ────────────────────────────────────────
+print("\n🔥 BẮT ĐẦU TRAINING IFT CHẶNG 3 (train_1c, tiếp nối từ adapter chặng 2)...")
+last_checkpoint = get_latest_checkpoint(OUTPUT_DIR)
+if last_checkpoint is not None:
+    print(f"⚠️ PHÁT HIỆN CHECKPOINT CŨ: chặng 3 có thể đã bị ngắt quãng.")
+    print(f"🔄 Khôi phục từ: {last_checkpoint}")
+    trainer.train(resume_from_checkpoint=last_checkpoint)
+else:
+    print("🚀 Không tìm thấy checkpoint cũ. Huấn luyện chặng 3 sạch từ đầu (vẫn tiếp nối adapter chặng 2).")
+    trainer.train()
+
+# ── BƯỚC A7: LƯU ADAPTER & LOGS ───────────────────────────────────────
+model.save_pretrained(ADAPTER_DIR)
+tokenizer.save_pretrained(ADAPTER_DIR)
+print(f"✅ Lưu adapter cuối chặng 3 tại: {ADAPTER_DIR}")
+
+pd.DataFrame(training_logs).to_csv(LOG_PATH, index=False)
+print(f"✅ Lưu training log tại: {LOG_PATH}")
+
+# Giải phóng VRAM trước khi load lại model ở chế độ inference (generate).
+del trainer, model, base_model
+gc.collect()
+torch.cuda.empty_cache()
+print("🧹 Đã giải phóng VRAM của model train trước khi chuyển sang inference.")
+
+# =====================================================================
+# PHẦN B: INFERENCE TRÊN TEST SET (generate + parse JSON, chỉ chạy 1 lần)
+# =====================================================================
+
+# ── BƯỚC B1: ĐỌC LẠI TEST SET CỐ ĐỊNH ─────────────────────────────────
+test_df = pd.read_csv(f"{SPLITS_DIR}/test.csv")
+print(f"\n✅ Đọc lại test set cố định từ chặng 1: {len(test_df)} mẫu")
+for t in TRAITS:
+    print(f"    {t}: {test_df[t].mean()*100:.1f}% positive (1)")
+
+# ── BƯỚC B2: KIỂM TRA TEST KHÔNG TRÙNG NỘI DUNG VỚI TRAIN/VAL ─────────
+def norm(s):
+    return str(s).strip().lower()
+
+test_text_set = set(test_df["TEXT_CLEAN"].apply(norm))
+overlap_text_count = 0
+for f in ["train_1a.csv", "train_1b.csv", "train_1c.csv", "val.csv"]:
+    other = pd.read_csv(f"{SPLITS_DIR}/{f}")
+    overlap_text_count += len(test_text_set & set(other["TEXT_CLEAN"].apply(norm)))
+if overlap_text_count > 0:
+    print(f"⚠️ CẢNH BÁO: phát hiện {overlap_text_count} dòng text trùng giữa test và train/val.")
+else:
+    print("✅ Kiểm tra nội dung text: không có text trùng giữa test và train/val.")
+
+# ── BƯỚC B3: LOAD TOKENIZER + MODEL (adapter chặng 3, để generate) ────
+gc.collect()
+torch.cuda.empty_cache()
+
+infer_tokenizer = AutoTokenizer.from_pretrained(ADAPTER_DIR, trust_remote_code=True)
+infer_tokenizer.pad_token = infer_tokenizer.eos_token
+infer_tokenizer.padding_side = "left"  # left padding cho generate theo batch (decoder-only)
+print("✅ Tokenizer inference sẵn sàng | padding_side = left (cho generate)")
+
+infer_bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.float16
+)
+
+infer_base_model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    quantization_config=infer_bnb_config,
+    device_map={"": 0},
+    trust_remote_code=True
+)
+infer_base_model.config.pad_token_id = infer_tokenizer.pad_token_id
+
+infer_model = PeftModel.from_pretrained(infer_base_model, ADAPTER_DIR, is_trainable=False)
+infer_model.config.use_cache = True   # bật lại cache để generate nhanh
+infer_model.eval()
+
+gc.collect()
+torch.cuda.empty_cache()
+if torch.cuda.is_available():
+    print(f"✅ Model inference sẵn sàng | VRAM: {torch.cuda.memory_allocated(0)/1024**3:.2f} GiB")
+
+# ── BƯỚC B4: HÀM PARSE JSON MULTI-TIER (json.loads → regex → fallback) ─
+def parse_prediction(generated_text):
+    """
+    Multi-tier parsing chuỗi sinh ra → dict {trait: 'y'/'n'}.
+    Tier 1: json.loads trực tiếp.
+    Tier 2: regex bắt {...} đầu tiên rồi json.loads.
+    Tier 3: regex bắt từng cặp "trait": "y/n" rời rạc.
+    Trả về (pred_dict, parse_ok). Nếu thiếu trait nào → mặc định 'n'.
+    """
+    pred, ok = {}, False
+    txt = generated_text.strip()
+    # Tier 1
+    try:
+        pred = json.loads(txt); ok = True
+    except json.JSONDecodeError:
+        # Tier 2
+        m = re.search(r'\{.*?\}', txt, re.DOTALL)
+        if m:
+            try:
+                pred = json.loads(m.group()); ok = True
+            except Exception:
+                ok = False
+        # Tier 3: bắt từng cặp trait:value rời
+        if not ok:
+            pred = {}
+            for t in TRAITS:
+                mm = re.search(rf'["\']?{t}["\']?\s*[:=]\s*["\']?([yn])', txt, re.IGNORECASE)
+                if mm:
+                    pred[t] = mm.group(1).lower()
+            ok = len(pred) > 0
+    # Chuẩn hoá: chỉ giữ y/n hợp lệ, thiếu thì mặc định 'n'
+    norm_pred = {}
+    for t in TRAITS:
+        v = str(pred.get(t, "n")).strip().lower()
+        norm_pred[t] = "y" if v == "y" else "n"
+    return norm_pred, ok
+
+# ── BƯỚC B5: GENERATE TRÊN TOÀN BỘ TEST SET ───────────────────────────
+INFERENCE_BATCH_SIZE = 8
+all_pred_yn, all_gt_yn = [], []
+parse_fail = 0
+raw_samples = []
+
+total_batches = (len(test_df) + INFERENCE_BATCH_SIZE - 1) // INFERENCE_BATCH_SIZE
+print(f"   Tổng số batch: {total_batches} | Batch size: {INFERENCE_BATCH_SIZE}")
+
+for bidx in range(total_batches):
+    start = bidx * INFERENCE_BATCH_SIZE
+    end   = min(start + INFERENCE_BATCH_SIZE, len(test_df))
+    batch_df = test_df.iloc[start:end]
+
+    prompts = []
+    for _, row in batch_df.iterrows():
+        messages = [{"role": "user", "content": f"{SYSTEM_PROMPT}\n\nText:\n{str(row['TEXT_CLEAN'])}"}]
+        prompts.append(infer_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
+
+    inputs = infer_tokenizer(prompts, return_tensors="pt", padding=True,
+                              truncation=True, max_length=MAX_LENGTH - 60).to(infer_model.device)
+    with torch.no_grad():
+        outputs = infer_model.generate(
+            **inputs,
+            max_new_tokens=60,
+            do_sample=False,
+            pad_token_id=infer_tokenizer.eos_token_id
+        )
+
+    gen_only = outputs[:, inputs["input_ids"].shape[1]:]
+    decoded  = infer_tokenizer.batch_decode(gen_only, skip_special_tokens=True)
+
+    for k, (_, row) in enumerate(batch_df.iterrows()):
+        pred_dict, ok = parse_prediction(decoded[k])
+        if not ok:
+            parse_fail += 1
+        all_pred_yn.append([1 if pred_dict[t] == "y" else 0 for t in TRAITS])
+        all_gt_yn.append([int(row[t]) for t in TRAITS])
+        if len(raw_samples) < 5:
+            raw_samples.append((str(row["TEXT_CLEAN"])[:80], decoded[k].strip()[:120], ok))
+
+    del inputs, outputs, gen_only
+    if bidx % 20 == 0:
+        gc.collect(); torch.cuda.empty_cache()
+        print(f"   [{bidx+1}/{total_batches}] VRAM: {torch.cuda.memory_allocated(0)/1024**3:.2f} GiB")
+
+all_preds  = np.array(all_pred_yn)
+all_labels = np.array(all_gt_yn)
+print(f"\n✅ Inference hoàn tất: {len(all_preds)} mẫu | Parse JSON thất bại: {parse_fail} "
+      f"({parse_fail/len(all_preds)*100:.1f}%)")
+
+print("\n   Ví dụ vài chuỗi sinh ra:")
+for txt, gen, ok in raw_samples:
+    print(f"     [{'OK ' if ok else 'FAIL'}] text='{txt}...' → gen='{gen}'")
+
+# ── BƯỚC B6: METRICS & XUẤT CSV ───────────────────────────────────────
+metrics_rows = []
+for i, trait in enumerate(TRAITS):
+    acc = accuracy_score(all_labels[:, i], all_preds[:, i])
+    pre = precision_score(all_labels[:, i], all_preds[:, i], zero_division=0)
+    rec = recall_score(all_labels[:, i], all_preds[:, i], zero_division=0)
+    f1  = f1_score(all_labels[:, i], all_preds[:, i], zero_division=0)
+    metrics_rows.append({"model": MODEL_LABEL, "trait": trait,
+                          "accuracy": round(acc, 4), "precision": round(pre, 4),
+                          "recall": round(rec, 4), "f1": round(f1, 4)})
+    print(f"   {trait:<5}: Acc={acc:.4f} | Pre={pre:.4f} | Rec={rec:.4f} | F1={f1:.4f}")
+
+macro_df = pd.DataFrame(metrics_rows)
+metrics_rows.append({"model": MODEL_LABEL, "trait": "MACRO",
+                      "accuracy": round(macro_df["accuracy"].mean(), 4),
+                      "precision": round(macro_df["precision"].mean(), 4),
+                      "recall": round(macro_df["recall"].mean(), 4),
+                      "f1": round(macro_df["f1"].mean(), 4)})
+print(f"   MACRO: Acc={macro_df['accuracy'].mean():.4f} | F1={macro_df['f1'].mean():.4f}")
+
+for trait in TRAITS:
+    pos_rate = test_df[trait].mean()
+    if pos_rate < 0.15 or pos_rate > 0.85:
+        print(f"   ⚠️ {trait}: tỉ lệ nhãn dương trong test = {pos_rate:.2%} — lệch nặng, ưu tiên xem macro-F1.")
+
+pd.DataFrame(metrics_rows).to_csv(f"{INFER_DIR}/metrics_summary.csv", index=False)
+
+pred_rows = []
+for i, (_, row) in enumerate(test_df.iterrows()):
+    entry = {"TEXT_CLEAN": str(row["TEXT_CLEAN"])[:500]}
+    for j, trait in enumerate(TRAITS):
+        entry[f"{trait}_gt"]   = int(all_labels[i, j])
+        entry[f"{trait}_pred"] = int(all_preds[i, j])
+    entry["exact_match"] = int(all(all_labels[i, j] == all_preds[i, j] for j in range(4)))
+    pred_rows.append(entry)
+pred_df = pd.DataFrame(pred_rows)
+pred_df.to_csv(f"{INFER_DIR}/test_predictions.csv", index=False)
+
+exact_rate = pred_df["exact_match"].mean() * 100
+print(f"\n   👉 Exact Match Rate (4/4 traits): {exact_rate:.1f}%")
+print(f"   👉 JSON parse fail rate: {parse_fail/len(all_preds)*100:.1f}%")
+
+correct_df = pred_df[pred_df["exact_match"] == 1]
+wrong_df   = pred_df[pred_df["exact_match"] == 0]
+pd.concat([correct_df.head(2), wrong_df.head(1)]).to_csv(f"{INFER_DIR}/case_studies.csv", index=False)
+print("✅ Đã xuất: metrics_summary.csv, test_predictions.csv, case_studies.csv")
+
+# ── BƯỚC B7: CONFUSION MATRIX ─────────────────────────────────────────
+fig, axes = plt.subplots(2, 2, figsize=(11, 9))
+fig.suptitle(f"Confusion Matrix — {MODEL_LABEL}", fontsize=15, fontweight="bold")
+for i, (trait, ax) in enumerate(zip(TRAITS, axes.flatten())):
+    cm = confusion_matrix(all_labels[:, i], all_preds[:, i])
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Purples",
+                xticklabels=["Pred: N", "Pred: Y"], yticklabels=["True: N", "True: Y"], ax=ax)
+    trait_f1 = f1_score(all_labels[:, i], all_preds[:, i], zero_division=0)
+    ax.set_title(f"{trait} (F1={trait_f1:.3f})", fontsize=12, fontweight="bold")
+plt.tight_layout()
+plt.savefig(f"{INFER_DIR}/confusion_matrix.png", dpi=150)
+plt.show()
+
+# ── BƯỚC B8: LOSS CURVE LIÊN THÔNG CHẶNG 1 + 2 + 3 ────────────────────
+log1 = pd.read_csv(CHANG1_LOG_PATH)
+log2 = pd.read_csv(CHANG2_LOG_PATH)
+log3 = pd.read_csv(LOG_PATH)
+
+offset_1 = log1["step"].max()
+log1 = log1.copy(); log1["global_step"] = log1["step"]
+log2 = log2.copy(); log2["global_step"] = log2["step"] + offset_1
+offset_2 = log2["global_step"].max()
+log3 = log3.copy(); log3["global_step"] = log3["step"] + offset_2
+
+full_logs  = pd.concat([log1, log2, log3], ignore_index=True).sort_values("global_step")
+train_logs = full_logs.dropna(subset=["train_loss"])
+eval_logs  = full_logs.dropna(subset=["eval_loss"])
+
+fig, ax1 = plt.subplots(figsize=(11, 5))
+ax1.plot(train_logs["global_step"], train_logs["train_loss"], color="#2196F3", label="Train Loss")
+if len(eval_logs) > 0:
+    ax1.plot(eval_logs["global_step"], eval_logs["eval_loss"], color="#F44336",
+              linestyle="--", marker="o", label="Val Loss")
+ax1.axvline(x=offset_1, color="green", linestyle=":", linewidth=1.5)
+ax1.text(offset_1 + 5, ax1.get_ylim()[1] * 0.9, "Chuyển sang chặng 2", color="green", fontsize=9)
+ax1.axvline(x=offset_2, color="purple", linestyle=":", linewidth=1.5)
+ax1.text(offset_2 + 5, ax1.get_ylim()[1] * 0.8, "Chuyển sang chặng 3", color="purple", fontsize=9)
+ax1.set_xlabel("Global step (chặng 1 + 2 + 3)")
+ax1.set_ylabel("Loss"); ax1.legend(); ax1.grid(alpha=0.3)
+plt.title(f"Learning Curve Continuous — {MODEL_LABEL}")
+plt.savefig(f"{INFER_DIR}/loss_curve.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+print("\n" + "=" * 60)
+print(f"🎉 HOÀN THÀNH CHẶNG 3 + INFERENCE — {MODEL_LABEL}")
+print(f"    Adapter chặng 3: {ADAPTER_DIR}")
+print(f"    Kết quả inference: {INFER_DIR}")
+print("=" * 60)

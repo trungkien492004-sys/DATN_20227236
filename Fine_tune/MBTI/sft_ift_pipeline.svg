@@ -1,0 +1,128 @@
+<svg viewBox="0 0 820 560" xmlns="http://www.w3.org/2000/svg" font-family="'Segoe UI', Arial, sans-serif">
+  <rect width="820" height="560" fill="white"/>
+  <text x="410" y="34" text-anchor="middle" font-size="17" font-weight="700" fill="#1a1a2e">Pipeline Fine-tuning QLoRA: SFT vs IFT</text>
+  <line x1="60" y1="44" x2="760" y2="44" stroke="#e0e0e0" stroke-width="1"/>
+
+  <!-- SFT Header -->
+  <rect x="40" y="56" width="340" height="36" rx="6" fill="#1a56db"/>
+  <text x="210" y="79" text-anchor="middle" font-size="14" font-weight="700" fill="white">SFT — Sinh văn bản (Text Generation)</text>
+
+  <!-- SFT Input -->
+  <rect x="60" y="108" width="300" height="52" rx="5" fill="#f0f5ff" stroke="#c7d7fa" stroke-width="1.2"/>
+  <text x="210" y="126" text-anchor="middle" font-size="11" font-weight="600" fill="#1a56db">Đầu vào (Input)</text>
+  <text x="210" y="142" text-anchor="middle" font-size="10.5" fill="#374151" font-style="italic">"[Văn bản]  →  [Nhãn tính cách]"</text>
+  <text x="210" y="155" text-anchor="middle" font-size="9.5" fill="#6b7280">Prompt + label nối liền thành chuỗi</text>
+  <line x1="210" y1="162" x2="210" y2="178" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- SFT Format -->
+  <rect x="60" y="180" width="300" height="62" rx="5" fill="#fffbeb" stroke="#fcd34d" stroke-width="1.2"/>
+  <text x="210" y="198" text-anchor="middle" font-size="11" font-weight="600" fill="#92400e">Định dạng dữ liệu</text>
+  <text x="210" y="213" text-anchor="middle" font-size="9.5" fill="#374151" font-family="'Courier New', monospace">văn_bản ▸ EXT:y OPN:n AGR:y ...</text>
+  <text x="210" y="228" text-anchor="middle" font-size="9.5" fill="#6b7280">Không có chat template</text>
+  <text x="210" y="238" text-anchor="middle" font-size="9" fill="#9ca3af">Chuỗi đơn liên tục</text>
+  <line x1="210" y1="244" x2="210" y2="260" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- SFT Loss -->
+  <rect x="60" y="262" width="300" height="70" rx="5" fill="#fef3f2" stroke="#fca5a5" stroke-width="1.2"/>
+  <text x="210" y="280" text-anchor="middle" font-size="11" font-weight="600" fill="#991b1b">Hàm Loss (Causal LM)</text>
+  <text x="95" y="298" font-size="9.5" fill="#374151">Token:</text>
+  <rect x="130" y="286" width="28" height="16" rx="2" fill="#fca5a5" stroke="#ef4444" stroke-width="1"/>
+  <text x="144" y="297" text-anchor="middle" font-size="8" fill="#7f1d1d">văn</text>
+  <rect x="161" y="286" width="28" height="16" rx="2" fill="#fca5a5" stroke="#ef4444" stroke-width="1"/>
+  <text x="175" y="297" text-anchor="middle" font-size="8" fill="#7f1d1d">bản</text>
+  <rect x="192" y="286" width="28" height="16" rx="2" fill="#fca5a5" stroke="#ef4444" stroke-width="1"/>
+  <text x="206" y="297" text-anchor="middle" font-size="8" fill="#7f1d1d">EXT</text>
+  <rect x="223" y="286" width="28" height="16" rx="2" fill="#fca5a5" stroke="#ef4444" stroke-width="1"/>
+  <text x="237" y="297" text-anchor="middle" font-size="8" fill="#7f1d1d">:y</text>
+  <rect x="254" y="286" width="28" height="16" rx="2" fill="#fca5a5" stroke="#ef4444" stroke-width="1"/>
+  <text x="268" y="297" text-anchor="middle" font-size="8" fill="#7f1d1d">OPN</text>
+  <text x="292" y="297" font-size="9" fill="#374151">...</text>
+  <text x="210" y="317" text-anchor="middle" font-size="9.5" fill="#991b1b" font-weight="600">Loss tính trên TẤT CẢ token</text>
+  <text x="210" y="329" text-anchor="middle" font-size="9" fill="#6b7280">(kể cả phần prompt đầu vào)</text>
+  <line x1="210" y1="334" x2="210" y2="350" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- SFT Output -->
+  <rect x="60" y="352" width="300" height="52" rx="5" fill="#f0fdf4" stroke="#86efac" stroke-width="1.2"/>
+  <text x="210" y="370" text-anchor="middle" font-size="11" font-weight="600" fill="#166534">Mô hình học được</text>
+  <text x="210" y="386" text-anchor="middle" font-size="9.5" fill="#374151">Sinh tiếp chuỗi ký tự theo xác suất</text>
+  <text x="210" y="399" text-anchor="middle" font-size="9" fill="#6b7280">Không đảm bảo định dạng JSON</text>
+
+  <!-- SFT Note -->
+  <rect x="60" y="418" width="300" height="28" rx="4" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1"/>
+  <text x="210" y="436" text-anchor="middle" font-size="9.5" fill="#1e40af">Điểm mạnh: học phân phối tự nhiên của văn bản</text>
+
+  <!-- IFT Header -->
+  <rect x="440" y="56" width="340" height="36" rx="6" fill="#7c3aed"/>
+  <text x="610" y="79" text-anchor="middle" font-size="14" font-weight="700" fill="white">IFT — Tuân thủ lệnh (Instruction Following)</text>
+
+  <!-- IFT Input -->
+  <rect x="460" y="108" width="300" height="52" rx="5" fill="#faf5ff" stroke="#d8b4fe" stroke-width="1.2"/>
+  <text x="610" y="126" text-anchor="middle" font-size="11" font-weight="600" fill="#7c3aed">Đầu vào (Input)</text>
+  <text x="610" y="142" text-anchor="middle" font-size="10.5" fill="#374151" font-style="italic">"[INST] Phân tích... [/INST] {JSON}"</text>
+  <text x="610" y="155" text-anchor="middle" font-size="9.5" fill="#6b7280">Chat template với system/user/assistant</text>
+  <line x1="610" y1="162" x2="610" y2="178" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- IFT Format -->
+  <rect x="460" y="180" width="300" height="62" rx="5" fill="#fffbeb" stroke="#fcd34d" stroke-width="1.2"/>
+  <text x="610" y="198" text-anchor="middle" font-size="11" font-weight="600" fill="#92400e">Định dạng dữ liệu</text>
+  <text x="610" y="213" text-anchor="middle" font-size="9.5" fill="#374151" font-family="'Courier New', monospace">[SYS] ... [USR] văn bản [AST] json</text>
+  <text x="610" y="228" text-anchor="middle" font-size="9.5" fill="#6b7280">Chat template chuẩn của từng mô hình</text>
+  <text x="610" y="238" text-anchor="middle" font-size="9" fill="#9ca3af">Phân tách rõ lượt system / user / assistant</text>
+  <line x1="610" y1="244" x2="610" y2="260" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- IFT Loss -->
+  <rect x="460" y="262" width="300" height="70" rx="5" fill="#fef3f2" stroke="#fca5a5" stroke-width="1.2"/>
+  <text x="610" y="280" text-anchor="middle" font-size="11" font-weight="600" fill="#991b1b">Hàm Loss (Masked)</text>
+  <text x="495" y="298" font-size="9.5" fill="#374151">Token:</text>
+  <rect x="530" y="286" width="28" height="16" rx="2" fill="#e5e7eb" stroke="#d1d5db" stroke-width="1"/>
+  <text x="544" y="297" text-anchor="middle" font-size="8" fill="#9ca3af">văn</text>
+  <rect x="561" y="286" width="28" height="16" rx="2" fill="#e5e7eb" stroke="#d1d5db" stroke-width="1"/>
+  <text x="575" y="297" text-anchor="middle" font-size="8" fill="#9ca3af">bản</text>
+  <rect x="592" y="286" width="28" height="16" rx="2" fill="#fca5a5" stroke="#ef4444" stroke-width="1"/>
+  <text x="606" y="297" text-anchor="middle" font-size="8" fill="#7f1d1d">EXT</text>
+  <rect x="623" y="286" width="28" height="16" rx="2" fill="#fca5a5" stroke="#ef4444" stroke-width="1"/>
+  <text x="637" y="297" text-anchor="middle" font-size="8" fill="#7f1d1d">:y</text>
+  <rect x="654" y="286" width="28" height="16" rx="2" fill="#fca5a5" stroke="#ef4444" stroke-width="1"/>
+  <text x="668" y="297" text-anchor="middle" font-size="8" fill="#7f1d1d">OPN</text>
+  <text x="692" y="297" font-size="9" fill="#374151">...</text>
+  <text x="610" y="317" text-anchor="middle" font-size="9.5" fill="#991b1b" font-weight="600">Loss chỉ tính trên token ASSISTANT</text>
+  <text x="610" y="329" text-anchor="middle" font-size="9" fill="#6b7280">(mask phần system + user prompt)</text>
+  <line x1="610" y1="334" x2="610" y2="350" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- IFT Output -->
+  <rect x="460" y="352" width="300" height="52" rx="5" fill="#f0fdf4" stroke="#86efac" stroke-width="1.2"/>
+  <text x="610" y="370" text-anchor="middle" font-size="11" font-weight="600" fill="#166534">Mô hình học được</text>
+  <text x="610" y="386" text-anchor="middle" font-size="9.5" fill="#374151">Tuân theo lệnh, sinh đúng định dạng JSON</text>
+  <text x="610" y="399" text-anchor="middle" font-size="9" fill="#6b7280">Bám sát cấu trúc suy luận 3 bước (CoT)</text>
+
+  <!-- IFT Note -->
+  <rect x="460" y="418" width="300" height="28" rx="4" fill="#faf5ff" stroke="#d8b4fe" stroke-width="1"/>
+  <text x="610" y="436" text-anchor="middle" font-size="9.5" fill="#6d28d9">Điểm mạnh: học tuân thủ định dạng chuẩn</text>
+
+  <!-- QLoRA shared -->
+  <rect x="200" y="460" width="420" height="72" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <text x="410" y="478" text-anchor="middle" font-size="11" font-weight="700" fill="#334155">QLoRA — Chung cho cả hai hướng</text>
+  <text x="410" y="494" text-anchor="middle" font-size="9.5" fill="#475569">Trọng số nền đóng băng (4-bit NF4)  •  Chỉ cập nhật ma trận LoRA</text>
+  <rect x="260" y="500" width="65" height="18" rx="3" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="292" y="513" text-anchor="middle" font-size="8.5" fill="#1e40af">W_base (lock)</text>
+  <text x="335" y="513" font-size="9" fill="#64748b">+</text>
+  <rect x="348" y="500" width="65" height="18" rx="3" fill="#fce7f3" stroke="#f9a8d4" stroke-width="1"/>
+  <text x="380" y="513" text-anchor="middle" font-size="8.5" fill="#9d174d">ΔW = BA</text>
+  <text x="423" y="513" font-size="9" fill="#64748b">rank r ≪ d</text>
+  <text x="410" y="526" text-anchor="middle" font-size="9" fill="#6b7280">Tham số huấn luyện giảm ~99%  •  gradient checkpointing + paged AdamW</text>
+
+  <!-- Divider -->
+  <line x1="410" y1="56" x2="410" y2="450" stroke="#e5e7eb" stroke-width="1.5" stroke-dasharray="6,4"/>
+
+  <!-- Legend -->
+  <rect x="60" y="450" width="110" height="8" rx="2" fill="#fca5a5" stroke="#ef4444" stroke-width="0.8"/>
+  <text x="175" y="458" font-size="8.5" fill="#374151">= tính loss</text>
+  <rect x="60" y="462" width="110" height="8" rx="2" fill="#e5e7eb" stroke="#d1d5db" stroke-width="0.8"/>
+  <text x="175" y="470" font-size="8.5" fill="#374151">= bị mask</text>
+
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#6b7280"/>
+    </marker>
+  </defs>
+</svg>

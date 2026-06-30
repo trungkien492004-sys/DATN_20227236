@@ -1,0 +1,3 @@
+strategy,n_valid,coverage,accuracy,f1_macro,f1_weighted
+zero_shot,8666,0.9997,0.7591,0.6928,0.7558
+few_shot,8669,1.0,0.764,0.7028,0.7614

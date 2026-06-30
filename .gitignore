@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints
+.pytest_cache/
+venv/
+.venv/
+env/
+
+# Environment files
+.env
+API.env
+
+# Large dataset files (over GitHub 50MB/100MB limit)
+DATA/Data_dung_trong_bai/mbti_1.csv
+File_clean/mbti_clean_deleaked.csv
+
+# Large zip archives
+*.zip
+*.tar.gz
+*.rar

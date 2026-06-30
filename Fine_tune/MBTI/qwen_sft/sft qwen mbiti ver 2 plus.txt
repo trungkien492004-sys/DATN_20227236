@@ -1,0 +1,490 @@
+# =====================================================================
+# NOTEBOOK 2: QWEN2.5-3B — SFT CHẶNG 2 + INFERENCE TRÊN TEST
+# Approach  : SFT thuần — classification head, KHÔNG dùng chat template
+# Nguyên tắc: KHÔNG tách lại tập. Đọc thẳng train_1b.csv / val.csv /
+# test.csv đã được notebook 1 lưu cố định.
+#   - PHẦN A (train chặng 2): chỉ dùng train_1b + val để train tiếp
+#     từ adapter chặng 1. test.csv CHỈ được dùng để kiểm tra cơ bản,
+#     KHÔNG được đưa vào model ở phần này.
+#   - PHẦN B (inference): đây là LẦN DUY NHẤT test set được đưa vào
+#     model — không dùng để chọn checkpoint, không dùng để tune
+#     hyperparameter. Chạy sau khi đã lưu xong adapter chặng 2.
+# =====================================================================
+
+# ============================================================
+# CELL 1 — CÀI THƯ VIỆN (PIN Y HỆT NOTEBOOK 1)
+# ============================================================
+!pip install -q \
+    transformers==4.47.0 \
+    peft==0.14.0 \
+    bitsandbytes>=0.44.0 \
+    accelerate==1.2.1 \
+    datasets==3.2.0 \
+    scikit-learn \
+    matplotlib \
+    seaborn \
+    --quiet
+print("✅ Cài thư viện xong!")
+
+# ============================================================
+# CELL 2 — IMPORT & CẤU HÌNH TOÀN CỤC
+# ============================================================
+import os, gc, warnings
+import torch
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datasets import Dataset
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+)
+from transformers import (
+    AutoModelForSequenceClassification, AutoTokenizer,
+    BitsAndBytesConfig, TrainingArguments,
+    Trainer, DataCollatorWithPadding,
+    TrainerCallback, set_seed
+)
+from peft import PeftModel, prepare_model_for_kbit_training
+
+warnings.filterwarnings("ignore")
+
+# QUAN TRỌNG: phải GIỐNG HỆT MODEL_NAME ở notebook 1.
+MODEL_NAME  = "Qwen/Qwen2.5-3B"
+MODEL_LABEL = "Qwen2.5-3B SFT Chặng 1+2"
+
+# !!! CẬP NHẬT đường dẫn dưới đây theo Kaggle Notebook Output thực tế
+# của notebook 1 sau khi attach làm Input !!!
+SPLITS_DIR         = "/kaggle/input/notebooks/fakekin/sft-qwen-mbiti-ver-1-plus/splits"
+CHANG1_ADAPTER_DIR = "/kaggle/input/notebooks/fakekin/sft-qwen-mbiti-ver-1-plus/final_model_chang1"
+CHANG1_LOG_PATH    = "/kaggle/input/notebooks/fakekin/sft-qwen-mbiti-ver-1-plus/training_logs_chang1.csv"
+
+ADAPTER_DIR = "/kaggle/working/final_model_chang2"
+LOG_PATH    = "/kaggle/working/training_logs_chang2.csv"
+OUTPUT_DIR  = "/kaggle/working/outputs_chang2"          # checkpoint tạm lúc train
+INFER_DIR   = "/kaggle/working/outputs_inference"        # kết quả inference cuối
+
+TRAITS                = ["mEXT", "mOPN", "mAGR", "mCON"]
+MAX_LENGTH             = 2048
+SEED                   = 42
+INFERENCE_BATCH_SIZE   = 8
+
+set_seed(SEED)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(INFER_DIR, exist_ok=True)
+
+assert os.path.exists(SPLITS_DIR), f"Không tìm thấy SPLITS_DIR: {SPLITS_DIR} — kiểm tra đã attach đúng Input chưa."
+assert os.path.exists(CHANG1_ADAPTER_DIR), f"Không tìm thấy adapter chặng 1: {CHANG1_ADAPTER_DIR}"
+
+print("=" * 60)
+print("⚙️  CẤU HÌNH NB2 — QWEN SFT CHẶNG 2 + INFERENCE")
+print("=" * 60)
+print(f"   Model      : {MODEL_NAME}")
+print(f"   Device     : {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+
+# =====================================================================
+# PHẦN A: TRAIN CHẶNG 2 (trên train_1b, tiếp nối adapter chặng 1)
+# =====================================================================
+
+# ── BƯỚC A1: ĐỌC LẠI SPLIT CỐ ĐỊNH (KHÔNG split lại) ───────────────
+train_1b_full = pd.read_csv(f"{SPLITS_DIR}/train_1b.csv")
+
+# 🛠️ FIX LEAK VALIDATION (điểm 1 review): val.csv đã được NB1 dùng để chọn
+# checkpoint tốt nhất ở chặng 1 → nếu chặng 2 lại dùng đúng val.csv đó để
+# load_best_model_at_end thì macro_f1 sẽ bị ẢO (overfit trên val). Cách vá
+# KHÔNG cần chạy lại NB1: cắt ~15% từ chính train_1b làm tập eval RIÊNG cho
+# chặng 2 (val_1b) — tập này model CHƯA TỪNG thấy ở chặng 1 nên eval sạch.
+from sklearn.model_selection import train_test_split
+train_1b_df, val_1b_df = train_test_split(train_1b_full, test_size=0.15, random_state=SEED)
+train_1b_df = train_1b_df.reset_index(drop=True)
+val_1b_df   = val_1b_df.reset_index(drop=True)
+
+# 🛡️ KIỂM TRA AN TOÀN val_1b: nếu val quá nhỏ hoặc thiếu hẳn 1 lớp ở bất kỳ
+# trait nào → macro-F1 dùng chọn checkpoint sẽ méo (F1 của trait đó luôn 0).
+# Nếu gặp cảnh báo này, tăng test_size hoặc đổi SEED.
+for _t in TRAITS:
+    _vc = val_1b_df[_t].nunique()
+    if _vc < 2:
+        print(f"   ⚠️ CẢNH BÁO: val_1b chỉ có 1 lớp ở trait {_t} → F1 trait này sẽ luôn = 0, "
+              f"macro-F1 chọn checkpoint bị méo. Cân nhắc tăng test_size hoặc đổi SEED.")
+if len(val_1b_df) < 50:
+    print(f"   ⚠️ CẢNH BÁO: val_1b chỉ {len(val_1b_df)} mẫu — quá nhỏ, macro-F1 sẽ nhiễu mạnh.")
+
+print(f"✅ Đọc lại split cố định từ notebook 1: train_1b gốc = {len(train_1b_full)} dòng")
+print(f"   → Cắt làm eval sạch cho chặng 2: Train chặng 2 = {len(train_1b_df)} | Val_1b = {len(val_1b_df)}")
+print(f"   ⚠️ KHÔNG dùng val.csv chung (đã leak ở chặng 1) để chọn checkpoint chặng 2.")
+print(f"   Phân phối nhãn (tỉ lệ dương tính) trong Train chặng 2:")
+for t in TRAITS:
+    print(f"      {t}: {train_1b_df[t].mean()*100:.1f}% positive (1)")
+
+# ── BƯỚC A2: TOKENIZER (load từ adapter chặng 1 để đảm bảo đồng nhất) ──
+tokenizer = AutoTokenizer.from_pretrained(CHANG1_ADAPTER_DIR, trust_remote_code=True)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "left"  # giữ nhất quán với chặng 1 (decoder-only)
+
+def tokenize_df(input_df, desc=""):
+    records = []
+    for _, row in input_df.iterrows():
+        tokens = tokenizer(
+            str(row["TEXT_CLEAN"]),
+            truncation=True,
+            max_length=MAX_LENGTH,
+            padding=False                  # KHÔNG pad ở đây — pad động theo batch qua collator
+        )
+        labels = [float(row[t]) for t in TRAITS]
+        records.append({
+            "input_ids":      tokens["input_ids"],
+            "attention_mask": tokens["attention_mask"],
+            "labels":         labels
+        })
+    dataset = Dataset.from_list(records)
+    print(f"   ✅ {desc}: {len(dataset)} samples")
+    return dataset
+
+train_dataset = tokenize_df(train_1b_df, "Train chặng 2")
+eval_dataset  = tokenize_df(val_1b_df,   "Val_1b (eval sạch chặng 2)")
+
+# ── BƯỚC A3: LOAD BASE MODEL 4-BIT + GẮN ADAPTER CHẶNG 1 ───────────
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.float16
+)
+
+base_model = AutoModelForSequenceClassification.from_pretrained(
+    MODEL_NAME,
+    num_labels=len(TRAITS),
+    problem_type="multi_label_classification",
+    quantization_config=bnb_config,
+    device_map="auto",
+    trust_remote_code=True
+)
+base_model.config.use_cache = False
+base_model.config.pad_token_id = tokenizer.pad_token_id
+base_model = prepare_model_for_kbit_training(base_model)
+
+print(f"🚀 Nạp adapter chặng 1 từ: {CHANG1_ADAPTER_DIR}")
+model = PeftModel.from_pretrained(base_model, CHANG1_ADAPTER_DIR, is_trainable=True)
+model.print_trainable_parameters()
+
+# ── BƯỚC A4: METRICS ────────────────────────────────────────────────
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    # 🛠️ FIX fp16 (điểm 3 review): fp16=True khiến logits có thể ở float16,
+    # np.exp trên float16 dễ tràn số → NaN. Ép float32 trước khi sigmoid.
+    logits = np.asarray(logits, dtype=np.float32)
+    probs  = 1 / (1 + np.exp(-logits))   # sigmoid
+    preds  = (probs >= 0.5).astype(int)
+    labels = labels.astype(int)
+
+    results = {}
+    f1_list = []
+    for i, trait in enumerate(TRAITS):
+        acc = accuracy_score(labels[:, i], preds[:, i])
+        pre = precision_score(labels[:, i], preds[:, i], zero_division=0)
+        rec = recall_score(labels[:, i], preds[:, i], zero_division=0)
+        f1  = f1_score(labels[:, i], preds[:, i], zero_division=0)
+        results[f"{trait}_acc"] = round(acc, 4)
+        results[f"{trait}_pre"] = round(pre, 4)
+        results[f"{trait}_rec"] = round(rec, 4)
+        results[f"{trait}_f1"]  = round(f1,  4)
+        f1_list.append(f1)
+
+    results["macro_f1"] = round(float(np.mean(f1_list)), 4)
+    return results
+
+# ── BƯỚC A5: TRAINING ARGS (đối xứng với notebook 1: cùng hyperparams) ──
+training_logs = []
+
+class LogCallback(TrainerCallback):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs and ("loss" in logs or "eval_loss" in logs):
+            entry = {
+                "stage":      "chang2",
+                "step":       state.global_step,
+                "epoch":      round(state.epoch, 4) if state.epoch else 0,
+                "train_loss": logs.get("loss"),
+                "eval_loss":  logs.get("eval_loss"),
+                "macro_f1":   logs.get("eval_macro_f1")
+            }
+            training_logs.append(entry)
+
+            if "loss" in logs:
+                print(f"   [Step {state.global_step:4d} | Epoch {state.epoch:.2f}] Train Loss = {logs['loss']:.4f}")
+            if "eval_loss" in logs:
+                print(f"   📊 [EVAL  | Step {state.global_step:4d}] "
+                      f"Val Loss = {logs['eval_loss']:.4f} | "
+                      f"Macro F1 = {logs.get('eval_macro_f1', 0):.4f}")
+
+# Dynamic padding theo batch — bắt buộc phải có vì Cell tokenize không pad sẵn.
+data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True, pad_to_multiple_of=8)
+
+training_args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    # 🛠️ Nếu gặp "CUDA out of memory": hạ per_device_train_batch_size=1 và
+    # tăng gradient_accumulation_steps=8 (giữ effective batch size = 8).
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=4,    # effective batch = 8
+    per_device_eval_batch_size=4,
+    learning_rate=2e-4,
+    lr_scheduler_type="cosine",
+    warmup_ratio=0.05,
+    weight_decay=0.01,
+    max_grad_norm=1.0,
+    num_train_epochs=2,          # train hết train chặng 2, không cắt cụt bằng max_steps cố định
+    fp16=True,
+    bf16=False,
+    optim="paged_adamw_8bit",
+    logging_steps=20,
+    eval_strategy="steps",
+    eval_steps=100,
+    save_strategy="steps",
+    save_steps=100,
+    save_total_limit=3,
+    load_best_model_at_end=True,
+    metric_for_best_model="macro_f1",
+    greater_is_better=True,
+    gradient_checkpointing=True,
+    dataloader_num_workers=0,
+    report_to="none",
+    seed=SEED
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
+    data_collator=data_collator,
+    tokenizer=tokenizer,
+    compute_metrics=compute_metrics,
+    callbacks=[LogCallback()]
+)
+
+gc.collect()
+torch.cuda.empty_cache()
+
+# ── BƯỚC A6: TRAIN ──────────────────────────────────────────────────
+print("\n🔥 BẮT ĐẦU TRAINING CHẶNG 2 (train_1b, tiếp nối từ adapter chặng 1)...")
+trainer.train()
+
+# ── BƯỚC A7: LƯU ADAPTER CUỐI CHẶNG 2 ───────────────────────────────
+model.save_pretrained(ADAPTER_DIR)
+tokenizer.save_pretrained(ADAPTER_DIR)
+print(f"✅ Lưu adapter cuối chặng 2 tại: {ADAPTER_DIR}")
+
+pd.DataFrame(training_logs).to_csv(LOG_PATH, index=False)
+print(f"✅ Lưu training log tại: {LOG_PATH}")
+
+# Giải phóng VRAM trước khi load lại model ở chế độ inference (eval-only).
+del trainer, model, base_model
+gc.collect()
+torch.cuda.empty_cache()
+print("🧹 Đã giải phóng VRAM của model train trước khi chuyển sang inference.")
+
+# =====================================================================
+# PHẦN B: INFERENCE TRÊN TEST SET (chỉ chạy 1 lần, sau khi train xong)
+# =====================================================================
+
+# ── BƯỚC B1: ĐỌC LẠI TEST SET CỐ ĐỊNH (KHÔNG split lại) ────────────
+test_df = pd.read_csv(f"{SPLITS_DIR}/test.csv")
+print(f"\n✅ Đọc lại test set cố định từ notebook 1: {len(test_df)} mẫu")
+print(f"   Phân phối nhãn (tỉ lệ dương tính) trong Test:")
+for t in TRAITS:
+    print(f"      {t}: {test_df[t].mean()*100:.1f}% positive (1)")
+
+# ── BƯỚC B2: KIỂM TRA CƠ BẢN — test không trùng nội dung với train/val ──
+def norm(s):
+    return str(s).strip().lower()
+
+test_text_set = set(test_df["TEXT_CLEAN"].apply(norm))
+overlap_text_count = 0
+for f in ["train_1a.csv", "train_1b.csv", "val.csv"]:
+    other = pd.read_csv(f"{SPLITS_DIR}/{f}")
+    overlap_text_count += len(test_text_set & set(other["TEXT_CLEAN"].apply(norm)))
+if overlap_text_count > 0:
+    print(f"⚠️ CẢNH BÁO: phát hiện {overlap_text_count} dòng text trùng giữa test và train/val.")
+else:
+    print("✅ Kiểm tra nội dung text: không có text trùng giữa test và train/val.")
+
+# ── BƯỚC B3: DỌN VRAM TRƯỚC KHI LOAD MODEL INFERENCE ───────────────
+gc.collect()
+torch.cuda.empty_cache()
+if torch.cuda.is_available():
+    total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    print(f"   GPU: {torch.cuda.get_device_name(0)} | VRAM tổng: {total:.1f} GiB")
+
+# ── BƯỚC B4: LOAD TOKENIZER (từ adapter chặng 2 — đồng nhất với lúc train) ──
+infer_tokenizer = AutoTokenizer.from_pretrained(ADAPTER_DIR, trust_remote_code=True)
+if infer_tokenizer.pad_token is None:
+    infer_tokenizer.pad_token = infer_tokenizer.eos_token
+infer_tokenizer.padding_side = "left"  # giữ nguyên như lúc train — tránh lệch hành vi giữa train/inference
+print("✅ Tokenizer sẵn sàng | padding_side = left")
+
+# ── BƯỚC B5: LOAD BASE MODEL 4-BIT + ADAPTER CHẶNG 2 (is_trainable=False) ──
+infer_bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.float16
+)
+
+infer_base_model = AutoModelForSequenceClassification.from_pretrained(
+    MODEL_NAME,
+    num_labels=len(TRAITS),
+    problem_type="multi_label_classification",
+    quantization_config=infer_bnb_config,
+    device_map="auto",
+    trust_remote_code=True
+)
+infer_base_model.config.pad_token_id = infer_tokenizer.pad_token_id
+
+infer_model = PeftModel.from_pretrained(infer_base_model, ADAPTER_DIR, is_trainable=False)
+infer_model.eval()
+
+gc.collect()
+torch.cuda.empty_cache()
+if torch.cuda.is_available():
+    allocated = torch.cuda.memory_allocated(0) / 1024**3
+    print(f"✅ Model inference sẵn sàng | VRAM đang dùng: {allocated:.2f} GiB")
+
+# ── BƯỚC B6: INFERENCE TRÊN TOÀN BỘ TEST SET (dynamic padding qua collator) ──
+infer_collator = DataCollatorWithPadding(tokenizer=infer_tokenizer, padding=True, pad_to_multiple_of=8)
+
+all_probs, all_preds, all_labels = [], [], []
+total_batches = (len(test_df) + INFERENCE_BATCH_SIZE - 1) // INFERENCE_BATCH_SIZE
+print(f"   Tổng số batch: {total_batches} | Batch size: {INFERENCE_BATCH_SIZE}")
+
+for idx in range(total_batches):
+    start = idx * INFERENCE_BATCH_SIZE
+    end   = min(start + INFERENCE_BATCH_SIZE, len(test_df))
+    batch_df = test_df.iloc[start:end]
+
+    raw_batch = []
+    labels = []
+    for _, r in batch_df.iterrows():
+        tokens = infer_tokenizer(str(r["TEXT_CLEAN"]), truncation=True, max_length=MAX_LENGTH, padding=False)
+        raw_batch.append({"input_ids": tokens["input_ids"], "attention_mask": tokens["attention_mask"]})
+        labels.append([int(r[t]) for t in TRAITS])
+
+    inputs = infer_collator(raw_batch)
+    inputs = {k: v.to(infer_model.device) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        logits = infer_model(**inputs).logits
+
+    probs = torch.sigmoid(logits.float()).cpu().numpy()
+    preds = (probs >= 0.5).astype(int)
+
+    all_probs.extend(probs.tolist())
+    all_preds.extend(preds.tolist())
+    all_labels.extend(labels)
+
+    del inputs, logits, probs, preds
+    if idx % 50 == 0:
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"   [{idx+1}/{total_batches}] VRAM: {torch.cuda.memory_allocated(0)/1024**3:.2f} GiB")
+
+all_probs  = np.array(all_probs)
+all_preds  = np.array(all_preds)
+all_labels = np.array(all_labels)
+print(f"\n✅ Inference hoàn tất: {len(all_preds)} mẫu")
+
+# ── BƯỚC B7: METRICS & XUẤT CSV ─────────────────────────────────────
+metrics_rows = []
+for i, trait in enumerate(TRAITS):
+    acc = accuracy_score(all_labels[:, i], all_preds[:, i])
+    pre = precision_score(all_labels[:, i], all_preds[:, i], zero_division=0)
+    rec = recall_score(all_labels[:, i], all_preds[:, i], zero_division=0)
+    f1  = f1_score(all_labels[:, i], all_preds[:, i], zero_division=0)
+    metrics_rows.append({"model": MODEL_LABEL, "trait": trait,
+                          "accuracy": round(acc, 4), "precision": round(pre, 4),
+                          "recall": round(rec, 4), "f1": round(f1, 4)})
+    print(f"   {trait:<5}: Acc={acc:.4f} | Pre={pre:.4f} | Rec={rec:.4f} | F1={f1:.4f}")
+
+macro_df = pd.DataFrame(metrics_rows)
+metrics_rows.append({"model": MODEL_LABEL, "trait": "MACRO",
+                      "accuracy": round(macro_df["accuracy"].mean(), 4),
+                      "precision": round(macro_df["precision"].mean(), 4),
+                      "recall": round(macro_df["recall"].mean(), 4),
+                      "f1": round(macro_df["f1"].mean(), 4)})
+print(f"   MACRO: Acc={macro_df['accuracy'].mean():.4f} | F1={macro_df['f1'].mean():.4f}")
+
+for trait in TRAITS:
+    pos_rate = test_df[trait].mean()
+    if pos_rate < 0.15 or pos_rate > 0.85:
+        print(f"   ⚠️ {trait}: tỉ lệ nhãn dương trong test = {pos_rate:.2%} — lệch nặng, "
+              f"acc cao có thể chỉ phản ánh việc đoán lớp đa số, nên ưu tiên xem macro-F1.")
+
+pd.DataFrame(metrics_rows).to_csv(f"{INFER_DIR}/metrics_summary.csv", index=False)
+
+pred_rows = []
+for i, (_, row) in enumerate(test_df.iterrows()):
+    entry = {"TEXT_CLEAN": str(row["TEXT_CLEAN"])[:500]}
+    for j, trait in enumerate(TRAITS):
+        entry[f"{trait}_gt"]   = int(all_labels[i, j])
+        entry[f"{trait}_pred"] = int(all_preds[i, j])
+        entry[f"{trait}_prob"] = round(float(all_probs[i, j]), 4)
+    entry["exact_match"] = int(all(all_labels[i, j] == all_preds[i, j] for j in range(4)))
+    pred_rows.append(entry)
+
+pred_df = pd.DataFrame(pred_rows)
+pred_df.to_csv(f"{INFER_DIR}/test_predictions.csv", index=False)
+
+exact_rate = pred_df["exact_match"].mean() * 100
+print(f"\n   👉 Exact Match Rate (4/4 traits): {exact_rate:.1f}%")
+
+correct_df = pred_df[pred_df["exact_match"] == 1]
+wrong_df   = pred_df[pred_df["exact_match"] == 0]
+pd.concat([correct_df.head(2), wrong_df.head(1)]).to_csv(f"{INFER_DIR}/case_studies.csv", index=False)
+print("✅ Đã xuất: metrics_summary.csv, test_predictions.csv, case_studies.csv")
+
+# ── BƯỚC B8: CONFUSION MATRIX ───────────────────────────────────────
+fig, axes = plt.subplots(2, 2, figsize=(11, 9))
+fig.suptitle(f"Confusion Matrix — {MODEL_LABEL}", fontsize=15, fontweight="bold")
+for i, (trait, ax) in enumerate(zip(TRAITS, axes.flatten())):
+    cm = confusion_matrix(all_labels[:, i], all_preds[:, i])
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Purples",
+                xticklabels=["Pred: N", "Pred: Y"], yticklabels=["True: N", "True: Y"], ax=ax)
+    trait_f1 = f1_score(all_labels[:, i], all_preds[:, i], zero_division=0)
+    ax.set_title(f"{trait} (F1={trait_f1:.3f})", fontsize=12, fontweight="bold")
+plt.tight_layout()
+plt.savefig(f"{INFER_DIR}/confusion_matrix.png", dpi=150)
+plt.show()
+
+# ── BƯỚC B9: LOSS CURVE LIÊN THÔNG CHẶNG 1 + CHẶNG 2 ────────────────
+log1 = pd.read_csv(CHANG1_LOG_PATH)
+log2 = pd.read_csv(LOG_PATH)
+offset = log1["step"].max()
+log1 = log1.copy()
+log1["global_step"] = log1["step"]
+log2 = log2.copy()
+log2["global_step"] = log2["step"] + offset
+
+full_logs  = pd.concat([log1, log2], ignore_index=True).sort_values("global_step")
+train_logs = full_logs.dropna(subset=["train_loss"])
+eval_logs  = full_logs.dropna(subset=["eval_loss"])
+
+fig, ax1 = plt.subplots(figsize=(10, 5))
+ax1.plot(train_logs["global_step"], train_logs["train_loss"], color="#2196F3", label="Train Loss")
+if len(eval_logs) > 0:
+    ax1.plot(eval_logs["global_step"], eval_logs["eval_loss"], color="#F44336",
+              linestyle="--", marker="o", label="Val Loss")
+ax1.axvline(x=offset, color="green", linestyle=":", linewidth=1.5)
+ax1.text(offset + 5, ax1.get_ylim()[1] * 0.85, "Chuyển sang chặng 2", color="green", fontsize=9)
+ax1.set_xlabel("Global step (chặng 1 + chặng 2)")
+ax1.set_ylabel("Loss")
+ax1.legend()
+ax1.grid(alpha=0.3)
+plt.title(f"Learning Curve Continuous — {MODEL_LABEL}")
+plt.savefig(f"{INFER_DIR}/loss_curve.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+print("\n" + "=" * 60)
+print(f"🎉 HOÀN THÀNH CHẶNG 2 + INFERENCE — {MODEL_LABEL}")
+print(f"   Adapter chặng 2: {ADAPTER_DIR}")
+print(f"   Kết quả inference: {INFER_DIR}")
+print("=" * 60)

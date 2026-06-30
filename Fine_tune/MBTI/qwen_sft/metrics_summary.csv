@@ -1,0 +1,6 @@
+model,trait,accuracy,precision,recall,f1
+Qwen2.5-3B SFT Chặng 1+2,mEXT,0.8339,0.6162,0.6421,0.6289
+Qwen2.5-3B SFT Chặng 1+2,mOPN,0.891,0.8999,0.9833,0.9398
+Qwen2.5-3B SFT Chặng 1+2,mAGR,0.8385,0.8305,0.8786,0.8539
+Qwen2.5-3B SFT Chặng 1+2,mCON,0.7249,0.7976,0.7432,0.7695
+Qwen2.5-3B SFT Chặng 1+2,MACRO,0.8221,0.786,0.8118,0.798

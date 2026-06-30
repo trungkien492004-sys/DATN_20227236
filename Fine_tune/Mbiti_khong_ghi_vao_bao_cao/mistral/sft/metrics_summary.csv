@@ -1,0 +1,6 @@
+model,trait,accuracy,precision,recall,f1
+Mistral SFT Chặng 2,mEXT,0.9308,0.8421,0.8421,0.8421
+Mistral SFT Chặng 2,mOPN,0.9504,0.9639,0.9793,0.9716
+Mistral SFT Chặng 2,mAGR,0.9175,0.9349,0.9098,0.9222
+Mistral SFT Chặng 2,mCON,0.9037,0.8972,0.9533,0.9244
+Mistral SFT Chặng 2,MACRO,0.9256,0.9095,0.9211,0.9151

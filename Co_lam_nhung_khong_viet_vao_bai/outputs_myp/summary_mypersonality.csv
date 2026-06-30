@@ -1,0 +1,7 @@
+model,strategy,n_samples,avg_accuracy,avg_f1_macro
+gpt-4.1-mini,cot,45,0.5689,0.382
+gpt-4.1-mini,few_shot,45,0.6133,0.5073
+gpt-4.1-mini,zero_shot,45,0.5867,0.4511
+qwen-2.5-7b,cot,45,0.5556,0.3506
+qwen-2.5-7b,few_shot,45,0.5422,0.3662
+qwen-2.5-7b,zero_shot,45,0.5467,0.3553
