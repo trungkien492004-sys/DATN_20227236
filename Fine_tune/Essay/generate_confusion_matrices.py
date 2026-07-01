@@ -47,18 +47,18 @@ CM_DATA = {
 
 # ── Training log CSV paths ─────────────────────────────────────────────────
 LOG_FILES = {
-    "Mitral SFT": os.path.join(BASE, "Mitral", "training_logs_mistral_sft_essays.csv"),
-    "Mitral IFT": os.path.join(BASE, "Mitral", "training_logs_mistral_ift_essays.csv"),
-    "Qwen SFT":   os.path.join(BASE, "Qwen",   "training_logs_qwen_sft.csv"),
-    "Qwen IFT":   os.path.join(BASE, "Qwen",   "training_logs _qwen_ift.csv"),
+    "Mitral SFT": os.path.join(BASE, "mistral_sft", "training_logs_mistral_sft.csv"),
+    "Mitral IFT": os.path.join(BASE, "mistral_ift", "training_logs_mistral_ift.csv"),
+    "Qwen SFT":   os.path.join(BASE, "qwen_sft",   "training_logs_qwen_sft.csv"),
+    "Qwen IFT":   os.path.join(BASE, "qwen_ift",   "training_logs_qwen_ift.csv"),
 }
 
 # ── Output folders ─────────────────────────────────────────────────────────
 OUT_FOLDERS = {
-    "Mitral SFT": os.path.join(BASE, "Mitral SFT"),
-    "Mitral IFT": os.path.join(BASE, "Mitral IFT"),
-    "Qwen SFT":   os.path.join(BASE, "Qwen SFT"),
-    "Qwen IFT":   os.path.join(BASE, "Qwen IFT"),
+    "Mitral SFT": os.path.join(BASE, "mistral_sft"),
+    "Mitral IFT": os.path.join(BASE, "mistral_ift"),
+    "Qwen SFT":   os.path.join(BASE, "qwen_sft"),
+    "Qwen IFT":   os.path.join(BASE, "qwen_ift"),
 }
 
 TRAITS = ["cEXT", "cNEU", "cAGR", "cCON", "cOPN"]
@@ -157,29 +157,28 @@ def plot_loss_curve(model_name, log_path, out_path):
 # Main
 # ══════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
+    MODEL_KEY_MAP = {
+        "Mitral SFT": "mistral_sft",
+        "Mitral IFT": "mistral_ift",
+        "Qwen SFT": "qwen_sft",
+        "Qwen IFT": "qwen_ift"
+    }
+
     for model_name in CM_DATA:
         out_dir = OUT_FOLDERS[model_name]
         os.makedirs(out_dir, exist_ok=True)
         print(f"\n[{model_name}]")
 
-        # Confusion matrix (only if not already generated)
-        cm_path = os.path.join(out_dir, "confusion_matrix.png")
+        key = MODEL_KEY_MAP[model_name]
+        # Confusion matrix
+        cm_path = os.path.join(out_dir, f"essays_{key}_cm.png")
         plot_confusion_matrices(model_name, CM_DATA[model_name], cm_path)
 
         # Loss curve
-        lc_path = os.path.join(out_dir, "loss_curve.png")
+        lc_path = os.path.join(out_dir, f"essays_{key}_loss.png")
         plot_loss_curve(model_name, LOG_FILES[model_name], lc_path)
 
-    print("\n✓ Done! Upload to Chapter5/images/ on TeXPage:")
-    mapping = [
-        ("Mitral SFT/confusion_matrix.png", "essays_mistral_sft_cm.png"),
-        ("Mitral IFT/confusion_matrix.png", "essays_mistral_ift_cm.png"),
-        ("Qwen SFT/confusion_matrix.png",   "essays_qwen_sft_cm.png"),
-        ("Qwen IFT/confusion_matrix.png",   "essays_qwen_ift_cm.png"),
-        ("Mitral SFT/loss_curve.png",       "essays_mistral_sft_loss.png"),
-        ("Mitral IFT/loss_curve.png",       "essays_mistral_ift_loss.png"),
-        ("Qwen SFT/loss_curve.png",         "essays_qwen_sft_loss.png"),
-        ("Qwen IFT/loss_curve.png",         "essays_qwen_ift_loss.png"),
-    ]
-    for src, dst in mapping:
-        print(f"  {src:45s} → {dst}")
+    print("\n[OK] Done! Output images generated inside:")
+    for model_name, out_dir in OUT_FOLDERS.items():
+        key = MODEL_KEY_MAP[model_name]
+        print(f"  {out_dir} -> essays_{key}_cm.png, essays_{key}_loss.png")
