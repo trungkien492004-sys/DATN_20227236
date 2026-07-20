@@ -1,0 +1,3 @@
+strategy,coverage,mEXT_pred_y_rate,mEXT_true_y_rate,mOPN_pred_y_rate,mOPN_true_y_rate,mAGR_pred_y_rate,mAGR_true_y_rate,mCON_pred_y_rate,mCON_true_y_rate
+zero_shot,1.0,0.2442,0.2314,0.8647,0.8624,0.3758,0.5403,0.4485,0.6023
+few_shot,1.0,0.2561,0.2311,0.8518,0.8613,0.4022,0.538,0.4536,0.6009

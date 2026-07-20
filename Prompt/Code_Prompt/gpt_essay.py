@@ -5,12 +5,19 @@ import asyncio
 import pandas as pd
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR.parent / "Output_prompt" / "essay_gpt"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+MERGED_FILE = OUTPUT_DIR / "predictions_gpt.csv"
 
 # ============================================================
 # SETUP
 # ============================================================
 
-load_dotenv(dotenv_path="API.env")
+load_dotenv(BASE_DIR / "API.env")
 
 client = AsyncOpenAI(
     api_key=os.getenv("OPENAI_API_KEY")
@@ -20,13 +27,29 @@ client = AsyncOpenAI(
 # LOAD DATA
 # ============================================================
 
-df = pd.read_csv("essays_clean.csv")
+DATA_FILE = "essays_clean.csv"
+
+# Tự động tìm file data trong project (tương đối theo vị trí script)
+# -> clone về máy khác vẫn chạy, không cần sửa path
+def find_data_file(filename, root):
+    matches = list(root.rglob(filename))
+    if not matches:
+        raise FileNotFoundError(
+            f"Không tìm thấy '{filename}' trong {root}. "
+            f"Kiểm tra lại tên file hoặc đặt file vào trong project."
+        )
+    return matches[0]
+
+# BASE_DIR.parent.parent = root project (DATA DATN)
+DATA_PATH = find_data_file(DATA_FILE, BASE_DIR.parent.parent)
+
+df = pd.read_csv(DATA_PATH, encoding="latin-1")
 
 df = df[
-    ["#AUTHID", "text", "cEXT", "cNEU", "cAGR", "cCON", "cOPN"]
+    ["#AUTHID", "TEXT_CLEAN", "cEXT", "cNEU", "cAGR", "cCON", "cOPN"]
 ].dropna()
 
-df = df.rename(columns={"#AUTHID": "authid"})
+df = df.rename(columns={"#AUTHID": "authid", "TEXT_CLEAN": "text"})
 
 TRAITS = ["cEXT", "cNEU", "cAGR", "cCON", "cOPN"]
 
@@ -96,6 +119,7 @@ TEXT:
 
 First briefly reason (2-3 sentences), then end with ONLY this JSON:
 {{"cEXT": "y", "cNEU": "n", "cAGR": "y", "cCON": "n", "cOPN": "y"}}"""
+
 PROMPTS = {
     "zero_shot": ZERO_SHOT_PROMPT,
     "few_shot": FEW_SHOT_PROMPT,
@@ -206,8 +230,36 @@ async def run_experiment(
 ):
 
     checkpoint_file = (
-        f"checkpoint_{prompt_name}.csv"
+        OUTPUT_DIR / f"checkpoint_{prompt_name}.csv"
     )
+
+    final_file = (
+        OUTPUT_DIR / f"predictions_{prompt_name}.csv"
+    )
+
+    all_ids = set(df_input["authid"].tolist())
+
+    # ========================================================
+    # CHECK FINAL FILE FIRST
+    # -> đủ hết rồi thì bỏ qua, không đụng checkpoint
+    # ========================================================
+
+    if os.path.exists(final_file):
+
+        done_df = pd.read_csv(final_file)
+
+        if all_ids.issubset(set(done_df["authid"].tolist())):
+
+            print(
+                f"Skip | {prompt_name} | "
+                f"đã xong ({len(done_df)} mẫu), dùng file cuối"
+            )
+
+            return done_df
+
+        print(
+            f"File cuối {prompt_name} thiếu mẫu -> resume tiếp"
+        )
 
     # ========================================================
     # LOAD CHECKPOINT
@@ -222,13 +274,30 @@ async def run_experiment(
         completed_ids = set(
             checkpoint_df["authid"].tolist()
         )
-
         results = checkpoint_df.to_dict(
             "records"
         )
 
         print(
             f"Resume checkpoint | "
+            f"{prompt_name} | "
+            f"{len(completed_ids)} completed"
+        )
+
+    elif os.path.exists(MERGED_FILE):
+
+        # Chưa có checkpoint riêng -> lấy từ file merge cũ (predictions_gpt.csv)
+        merged_df = pd.read_csv(MERGED_FILE)
+
+        strat_df = merged_df[
+            merged_df["prompt_strategy"] == prompt_name
+        ]
+
+        completed_ids = set(strat_df["authid"].tolist())
+        results = strat_df.to_dict("records")
+
+        print(
+            f"Resume từ file merge | "
             f"{prompt_name} | "
             f"{len(completed_ids)} completed"
         )
@@ -358,6 +427,11 @@ async def run_experiment(
         index=False
     )
 
+    final_df.to_csv(
+        final_file,
+        index=False
+    )
+
     return final_df
 
 # ============================================================
@@ -447,10 +521,9 @@ async def main():
     )
 
     final_df.to_csv(
-        "predictions_gpt.csv",
+        OUTPUT_DIR / "predictions_gpt.csv",
         index=False
     )
-
     print("\nSaved predictions_gpt.csv")
 
     calculate_accuracy(final_df)
@@ -463,4 +536,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-

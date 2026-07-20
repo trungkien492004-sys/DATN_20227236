@@ -3,13 +3,36 @@ import json
 import time
 import re
 import pandas as pd
+from pathlib import Path
 from openai import OpenAI
 from dotenv import load_dotenv
 
 # ============================================================
+# PATHS (tương đối theo vị trí script -> clone về vẫn chạy)
+# ============================================================
+
+BASE_DIR   = Path(__file__).resolve().parent                       # Prompt/Code_Prompt
+OUTPUT_DIR = BASE_DIR.parent / "Output_prompt" / "essay_mistral"   # Prompt/Output_prompt/essay_mistral
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+DATA_FILE = "essays_clean.csv"
+
+def find_data_file(filename, root):
+    matches = list(root.rglob(filename))
+    if not matches:
+        raise FileNotFoundError(
+            f"Không tìm thấy '{filename}' trong {root}. "
+            f"Kiểm tra lại tên file hoặc đặt file vào trong project."
+        )
+    return matches[0]
+
+# BASE_DIR.parent.parent = root project (DATA DATN)
+DATA_PATH = find_data_file(DATA_FILE, BASE_DIR.parent.parent)
+
+# ============================================================
 # SETUP
 # ============================================================
-load_dotenv(dotenv_path="API.env")
+load_dotenv(dotenv_path=BASE_DIR / "API.env")
 
 client = OpenAI(
     api_key=os.getenv("OPENROUTER_API_KEY"),
@@ -19,9 +42,15 @@ client = OpenAI(
 
 MODEL = "mistralai/mistral-small-3.1-24b-instruct"
 
-df = pd.read_csv("essays_clean.csv")
-df = df[["#AUTHID", "text", "cEXT", "cNEU", "cAGR", "cCON", "cOPN"]].dropna()
+
+df = pd.read_csv(DATA_PATH)
+df = df[["#AUTHID", "TEXT_CLEAN", "cEXT", "cNEU", "cAGR", "cCON", "cOPN"]].dropna()
+df = df.rename(columns={"TEXT_CLEAN": "text"})
 TRAITS = ["cEXT", "cNEU", "cAGR", "cCON", "cOPN"]
+
+# File merge cuối (dùng để resume nếu không có checkpoint riêng)
+MODEL_SLUG  = MODEL.replace("/", "-").replace(":", "-")
+MERGED_FILE = OUTPUT_DIR / f"predictions_{MODEL_SLUG}.csv"
 
 # ============================================================
 # PROMPT TEMPLATES
@@ -100,7 +129,7 @@ PROMPTS = {
 
 def extract_json(raw_output: str):
     raw = raw_output.strip()
-    
+
     # Cách 1: Tìm khối JSON lớn nhất
     match = re.search(r'\{[\s\S]*\}', raw)
     if match:
@@ -108,16 +137,16 @@ def extract_json(raw_output: str):
             return json.loads(match.group(0))
         except:
             pass
-    
+
     # Cách 2: Loại bỏ markdown
     cleaned = re.sub(r'```(?:json)?\s*', '', raw)
     cleaned = re.sub(r'\s*```', '', cleaned)
-    
+
     try:
         return json.loads(cleaned)
     except:
         pass
-    
+
     # Cách 3: Cắt thủ công từ { đến }
     try:
         start = cleaned.find('{')
@@ -126,7 +155,7 @@ def extract_json(raw_output: str):
             return json.loads(cleaned[start:end])
     except:
         pass
-    
+
     raise json.JSONDecodeError("Cannot extract JSON", raw, 0)
 
 
@@ -150,7 +179,7 @@ def predict_ocean(prompt_template, text):
                     {"role": "user", "content": prompt}
                 ]
             )
-            
+
             raw = response.choices[0].message.content.strip()
             parsed = extract_json(raw)
 
@@ -174,7 +203,7 @@ def predict_ocean(prompt_template, text):
 
         except json.JSONDecodeError:
             print(f"  [Attempt {attempt+1}/{max_attempts}] JSON parse error → retrying")
-            
+
         except Exception as e:
             err_str = str(e).lower()
             if "429" in err_str or "rate limit" in err_str or "quota" in err_str:
@@ -184,7 +213,7 @@ def predict_ocean(prompt_template, text):
             else:
                 print(f"  [Attempt {attempt+1}/{max_attempts}] Error: {type(e).__name__} → retrying")
                 time.sleep(2)
-        
+
         attempt += 1
         time.sleep(1.5)
 
@@ -201,14 +230,33 @@ def run_experiment(df_input, prompt_name, prompt_template):
     print(f"Running: {prompt_name.upper()} | {MODEL} | {len(df_input)} samples")
     print(f"{'='*50}")
 
-    model_slug = MODEL.replace("/", "-").replace(":", "-")
-    ckpt_file  = f"checkpoint_{prompt_name}_{model_slug}.csv"
-    
+    ckpt_file  = OUTPUT_DIR / f"checkpoint_{prompt_name}_{MODEL_SLUG}.csv"
+    final_file = OUTPUT_DIR / f"predictions_{prompt_name}_{MODEL_SLUG}.csv"
+
+    all_ids = set(df_input["#AUTHID"].tolist())
+
+    # --- Check file cuối trước: đủ hết thì bỏ qua ---
+    if os.path.exists(final_file):
+        done_df = pd.read_csv(final_file)
+        if "authid" in done_df.columns and all_ids.issubset(set(done_df["authid"].tolist())):
+            print(f"  Skip | {prompt_name} | đã xong ({len(done_df)} mẫu), dùng file cuối")
+            return done_df
+        print(f"  File cuối {prompt_name} thiếu mẫu -> resume tiếp")
+
+    # --- Chưa xong: nạp checkpoint / file merge cũ ---
     if os.path.exists(ckpt_file):
         done_df  = pd.read_csv(ckpt_file)
         done_ids = set(done_df["authid"].tolist())
         results  = done_df.to_dict("records")
-        print(f"  Resumed: {len(done_ids)} done, {len(df_input)-len(done_ids)} remaining")
+        print(f"  Resume checkpoint: {len(done_ids)} done, {len(df_input)-len(done_ids)} remaining")
+
+    elif os.path.exists(MERGED_FILE):
+        merged_df = pd.read_csv(MERGED_FILE)
+        strat_df  = merged_df[merged_df["prompt_strategy"] == prompt_name]
+        done_ids  = set(strat_df["authid"].tolist())
+        results   = strat_df.to_dict("records")
+        print(f"  Resume từ file merge: {len(done_ids)} done, {len(df_input)-len(done_ids)} remaining")
+
     else:
         done_ids = set()
         results  = []
@@ -235,8 +283,10 @@ def run_experiment(df_input, prompt_name, prompt_template):
 
         time.sleep(0.5)
 
-    pd.DataFrame(results).to_csv(ckpt_file, index=False)
-    return pd.DataFrame(results)
+    df_result = pd.DataFrame(results)
+    df_result.to_csv(ckpt_file, index=False)
+    df_result.to_csv(final_file, index=False)
+    return df_result
 
 
 # ============================================================
@@ -249,12 +299,9 @@ for prompt_name, prompt_template in PROMPTS.items():
     df_result = run_experiment(df, prompt_name, prompt_template)   # dùng df thay vì df_sample
     all_results.append(df_result)
 
-model_slug  = MODEL.replace("/", "-").replace(":", "-")
-output_file = f"predictions_{model_slug}.csv"
-
 final_df = pd.concat(all_results, ignore_index=True)
-final_df.to_csv(output_file, index=False)
-print(f"\nDone! Saved to {output_file}")
+final_df.to_csv(MERGED_FILE, index=False)
+print(f"\nDone! Saved to {MERGED_FILE}")
 print(final_df.groupby("prompt_strategy").size())
 
 # ============================================================

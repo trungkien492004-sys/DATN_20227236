@@ -2,15 +2,38 @@ import os
 import json
 import time
 import pandas as pd
+from pathlib import Path
 from sklearn.metrics import classification_report, f1_score
 from openai import OpenAI
 from dotenv import load_dotenv
 
 # ============================================================
+# PATHS (tương đối theo vị trí script -> clone về vẫn chạy)
+# ============================================================
+
+BASE_DIR   = Path(__file__).resolve().parent                       # Prompt/Code_Prompt
+OUTPUT_DIR = BASE_DIR.parent / "Output_prompt" / "mbti_mistral"    # Prompt/Output_prompt/mbti_mistral
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+DATA_FILE = "mbti_clean_deleaked.csv"
+
+def find_data_file(filename, root):
+    matches = list(root.rglob(filename))
+    if not matches:
+        raise FileNotFoundError(
+            f"Không tìm thấy '{filename}' trong {root}. "
+            f"Kiểm tra lại tên file hoặc đặt file vào trong project."
+        )
+    return matches[0]
+
+# BASE_DIR.parent.parent = root project (DATA DATN)
+DATA_PATH = find_data_file(DATA_FILE, BASE_DIR.parent.parent)
+
+# ============================================================
 # SETUP
 # ============================================================
 
-load_dotenv(dotenv_path="API.env")
+load_dotenv(dotenv_path=BASE_DIR / "API.env")
 
 client = OpenAI(
     api_key=os.getenv("OPENROUTER_API_KEY"),
@@ -18,14 +41,19 @@ client = OpenAI(
 )
 
 MODEL     = "mistralai/mistral-small-3.1-24b-instruct"
+
 TEXT_COL  = "TEXT_CLEAN"
 LABEL_COL = "type"
 
-df = pd.read_csv("mbti_clean_deleaked.csv", engine="python")
+df = pd.read_csv(DATA_PATH, engine="python")
 df = df.dropna(subset=[TEXT_COL, LABEL_COL]).reset_index(drop=True)
 df["sample_id"] = df.index
 print(f"Loaded {len(df)} samples")
 print(df[LABEL_COL].value_counts().head(8))
+
+# File merge cuối (dùng để resume nếu không có checkpoint riêng)
+MODEL_SLUG  = MODEL.replace("/", "-").replace(":", "-")
+MERGED_FILE = OUTPUT_DIR / f"predictions_mbti_{MODEL_SLUG}.csv"
 
 # ============================================================
 # PROMPT TEMPLATES
@@ -72,8 +100,6 @@ Return ONLY valid JSON:
 {{"type": "INTJ"}}"""
 
 
-
-
 PROMPTS = {
     "zero_shot": ZERO_SHOT_PROMPT,
     "few_shot":  FEW_SHOT_PROMPT,
@@ -91,7 +117,7 @@ MBTI_TYPES = [
 # ============================================================
 
 def predict_mbti(prompt_template, text, prompt_name, retries=5):
-    text_truncated = text  
+    text_truncated = text
     prompt = prompt_template.format(text=text_truncated)
 
     max_tok = 30
@@ -118,7 +144,7 @@ def predict_mbti(prompt_template, text, prompt_name, retries=5):
             end   = cleaned.rfind("}") + 1
 
             parsed = json.loads(cleaned[start:end])
-            
+
             mbti_type = parsed.get("type", "").upper().strip()
             if mbti_type in MBTI_TYPES:
                 return mbti_type
@@ -143,24 +169,37 @@ def predict_mbti(prompt_template, text, prompt_name, retries=5):
 # RUN EXPERIMENT với CHECKPOINT
 # ============================================================
 
+def load_prior_results(output_dir, id_col, strategy):
+    """Quét mọi .csv trong OUTPUT_DIR, gom mẫu đã xong theo strategy (mọi tên file)."""
+    done_ids, results = set(), []
+    for f in Path(output_dir).glob("*.csv"):
+        try:
+            d = pd.read_csv(f)
+        except Exception:
+            continue
+        if id_col not in d.columns or "prompt_strategy" not in d.columns:
+            continue
+        d = d[d["prompt_strategy"] == strategy]
+        for r in d.to_dict("records"):
+            if r[id_col] not in done_ids:
+                done_ids.add(r[id_col])
+                results.append(r)
+    return done_ids, results
+
+
 def run_experiment(df_input, prompt_name, prompt_template):
     print(f"\n{'='*60}")
     print(f"RUNNING: {prompt_name.upper()} | {MODEL} | {len(df_input)} samples")
     print(f"{'='*60}")
 
-    model_slug = MODEL.replace("/", "-").replace(":", "-")
-    ckpt_file  = f"checkpoint_mbti_{prompt_name}_{model_slug}.csv"
+    ckpt_file  = OUTPUT_DIR / f"checkpoint_mbti_{prompt_name}_{MODEL_SLUG}.csv"
+    final_file = OUTPUT_DIR / f"predictions_mbti_{prompt_name}_{MODEL_SLUG}.csv"
 
-    if os.path.exists(ckpt_file):
-        done_df = pd.read_csv(ckpt_file)
-        if "sample_id" not in done_df.columns:
-            done_df["sample_id"] = done_df.index
-        done_ids = set(done_df["sample_id"].tolist())
-        results  = done_df.to_dict("records")
-        print(f"  Resumed: {len(done_ids)} done, {len(df_input)-len(done_ids)} remaining")
-    else:
-        done_ids = set()
-        results  = []
+    all_ids = set(df_input["sample_id"].tolist())
+
+    # --- Gom mọi kết quả cũ trong OUTPUT_DIR (mọi tên file) ---
+    done_ids, results = load_prior_results(OUTPUT_DIR, "sample_id", prompt_name)
+    print(f"  Resume: {len(done_ids)} done, {len(all_ids) - len(done_ids & all_ids)} remaining")
 
     for _, row in df_input.iterrows():
         sid = row["sample_id"]
@@ -189,6 +228,7 @@ def run_experiment(df_input, prompt_name, prompt_template):
 
     df_result = pd.DataFrame(results)
     df_result.to_csv(ckpt_file, index=False)
+    df_result.to_csv(final_file, index=False)
     print(f"  Done: {len(df_result)} samples")
     return df_result
 
@@ -202,12 +242,9 @@ for prompt_name, prompt_template in PROMPTS.items():
     df_result = run_experiment(df, prompt_name, prompt_template)
     all_results.append(df_result)
 
-model_slug  = MODEL.replace("/", "-").replace(":", "-")
-output_file = f"predictions_mbti_{model_slug}.csv"
-
 final_df = pd.concat(all_results, ignore_index=True)
-final_df.to_csv(output_file, index=False)
-print(f"\nSaved {output_file}")
+final_df.to_csv(MERGED_FILE, index=False)
+print(f"\nSaved {MERGED_FILE}")
 
 # ============================================================
 # EVALUATION — 4 CHIỀU NHỊ PHÂN (khớp fine-tune) + 16 lớp tham chiếu
@@ -239,29 +276,29 @@ for strategy in PROMPTS.keys():
 
     # Tách cả nhãn thật lẫn nhãn dự đoán thành 4 bit
     true_bits = (
-    valid["true_type"]
-    .apply(type_to_bits)
-    .apply(pd.Series)
-    .add_prefix("true_")
-    .reset_index(drop=True)
-)
+        valid["true_type"]
+        .apply(type_to_bits)
+        .apply(pd.Series)
+        .add_prefix("true_")
+        .reset_index(drop=True)
+    )
 
     pred_bits = (
-    valid["pred_type"]
-    .apply(type_to_bits)
-    .apply(pd.Series)
-    .add_prefix("pred_")
-    .reset_index(drop=True)
-)
+        valid["pred_type"]
+        .apply(type_to_bits)
+        .apply(pd.Series)
+        .add_prefix("pred_")
+        .reset_index(drop=True)
+    )
 
     valid = pd.concat(
-    [
-        valid.reset_index(drop=True),
-        true_bits,
-        pred_bits
-    ],
-    axis=1
-)
+        [
+            valid.reset_index(drop=True),
+            true_bits,
+            pred_bits
+        ],
+        axis=1
+    )
     coverage = len(valid) / len(subset)
     print(f"\n--- {strategy} | n_valid={len(valid)}/{len(subset)} (coverage {coverage:.1%}) ---")
 
@@ -299,7 +336,7 @@ for strategy in PROMPTS.keys():
     summary_rows.append(row)
 
 df_summary = pd.DataFrame(summary_rows)
-df_summary.to_csv("summary_mbti_mistral.csv", index=False)
+df_summary.to_csv(OUTPUT_DIR / "summary_mbti_mistral.csv", index=False)
 print("\nSaved summary_mbti_mistral.csv")
 print(df_summary.to_string(index=False))
 print("\nDONE!")
@@ -361,8 +398,8 @@ for strategy in PROMPTS.keys():
     bias_rows.append(row)
 
 df_bias = pd.DataFrame(bias_rows)
-df_bias.to_csv("bias_mbti_gpt.csv", index=False)
-print("\nSaved bias_mbti_gpt.csv")
+df_bias.to_csv(OUTPUT_DIR / "bias_mbti_mistral.csv", index=False)
+print("\nSaved bias_mbti_mistral.csv")
 print(df_bias.to_string(index=False))
 
 # ============================================================
@@ -379,4 +416,4 @@ for strategy in PROMPTS.keys():
     print(f"\n--- {strategy} ---")
     dist = valid["pred_type"].value_counts(normalize=True).mul(100).round(2)
     print(dist.to_string())
-    dist.to_csv(f"pred_dist_mbti_{strategy}.csv", header=["percent"])
+    dist.to_csv(OUTPUT_DIR / f"pred_dist_mbti_{strategy}.csv", header=["percent"])
